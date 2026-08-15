@@ -1,246 +1,231 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <FirebaseESP32.h>
 #include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
 
-// ==========================================
-// 1. 네트워크 및 Firebase 설정
-// ==========================================
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
-#define FIREBASE_HOST "YOUR_PROJECT_ID.firebaseio.com" // https:// 제외
-#define FIREBASE_AUTH "YOUR_FIREBASE_DATABASE_SECRET"
+// Hardware pins
+constexpr int EMG_CH1 = 34;  // extensor: open-hand command
+constexpr int EMG_CH2 = 35;  // flexor: emergency stop command
+constexpr int SERVO_COUNT = 4;
+const int SERVO_PIN[SERVO_COUNT] = {16, 17, 18, 19};
 
-FirebaseData fbdo;
-FirebaseAuth auth;
-FirebaseConfig config;
+// Motion and safety settings.  Tune MAX_SAFE_CURRENT_MA after measuring the
+// normal running current of the complete servo supply.
+// MG92B is a 180-degree positional servo.  Use its electrical centre as the
+// mechanical home; commanding 0 degrees at startup drives it to an end stop.
+// Fit each servo horn while this firmware is holding HOME_ANGLE.
+constexpr int HOME_ANGLE = 90;
+constexpr int OPEN_ANGLE = 135;
+constexpr uint32_t STEP_INTERVAL_MS = 45;   // 1 degree / 45 ms: slow motion
+constexpr uint32_t HOLD_TIME_MS = 3000;
+constexpr uint32_t EMG_SAMPLE_PERIOD_MS = 10;
+constexpr uint32_t EMG_DEBUG_PERIOD_MS = 500;
+constexpr float MAX_SAFE_CURRENT_MA = 1200.0f;
+constexpr uint8_t CURRENT_TRIP_SAMPLES = 2; // reject one noisy INA219 sample
 
-// ==========================================
-// 2. 핀 정의 & 객체 생성
-// ==========================================
-const int PIN_EMG_CH1 = 34;   // Extensor (신전근)
-const int PIN_EMG_CH2 = 35;   // Flexor (굴곡근)
-const int PIN_ANGLE_SENSOR = 32; // PIP 관절 각도 센서 (포텐쇼미터)
-const int PIN_SERVO = 18;      // 모터 1개
+Servo servos[SERVO_COUNT];
+Adafruit_INA219 ina219;
+bool ina219Available = false;
 
-Servo motor1;
+int ch1Threshold = 2400;
+int ch2Threshold = 2000;
+int currentAngle[SERVO_COUNT] = {HOME_ANGLE, HOME_ANGLE, HOME_ANGLE, HOME_ANGLE};
+int targetAngle = HOME_ANGLE;
 
-// ==========================================
-// 3. 내부 상태 및 제어 변수 (DB 노드 동기화)
-// ==========================================
-String mode = "STOP";
-int target_angle = 55;
-int hold_time_sec = 3;
-int motor_level = 1;
-int threshold_ch1 = 1800;
-int flexor_limit = 2500;
+enum class State { WAIT_FOR_COMMAND, OPENING, HOLDING, RETURNING };
+State state = State::WAIT_FOR_COMMAND;
+uint32_t lastStepAt = 0;
+uint32_t holdStartedAt = 0;
+uint32_t lastEmgSampleAt = 0;
+uint32_t lastEmgDebugAt = 0;
+int filteredCh1 = 0;
+int filteredCh2 = 0;
+uint8_t overCurrentSamples = 0;
 
-bool is_triggered = false;
-bool is_cocontraction = false;
+int readAverage(int pin, uint8_t samples = 4) {
+  uint32_t total = 0;
+  for (uint8_t i = 0; i < samples; ++i) {
+    total += analogRead(pin);
+    delay(2);
+  }
+  return total / samples;
+}
 
-// 보조 타스크 및 타이머 변수
-unsigned long mode_timer = 0;
-unsigned long response_start_time = 0;
+void calibrateEMG() {
+  Serial.println("\n[EMG calibration]");
+  Serial.println("Relax your hand. Measuring baseline in 2 seconds...");
+  delay(2000);
 
-// ==========================================
-// 4. 함수 선언
-// ==========================================
-int readAngle();
-void updateControlFromDB();
-void runDailyTest();
-void runTraining();
-void setMotorAngle(int angle);
+  uint32_t ch1RestSum = 0, ch2RestSum = 0;
+  for (uint8_t i = 0; i < 100; ++i) {
+    ch1RestSum += analogRead(EMG_CH1);
+    ch2RestSum += analogRead(EMG_CH2);
+    delay(10);
+  }
+  const int ch1Rest = ch1RestSum / 100;
+  const int ch2Rest = ch2RestSum / 100;
+
+  Serial.println("Extend/open your fingers firmly for 3 seconds...");
+  delay(1000);
+  int ch1Max = ch1Rest;
+  const uint32_t ch1StartedAt = millis();
+  while (millis() - ch1StartedAt < 3000) {
+    // Use the same averaged value used in loop(), not a short ADC spike.
+    ch1Max = max(ch1Max, readAverage(EMG_CH1));
+    delay(5);
+  }
+
+  Serial.println("Make a fist firmly for 3 seconds...");
+  delay(1000);
+  int ch2Max = ch2Rest;
+  const uint32_t ch2StartedAt = millis();
+  while (millis() - ch2StartedAt < 3000) {
+    ch2Max = max(ch2Max, readAverage(EMG_CH2));
+    delay(5);
+  }
+
+  // CH1 requires a deliberate contraction. CH2 uses a lower threshold so it
+  // remains a sensitive emergency-stop signal.
+  // 30% is intentionally sensitive: EMG modules vary substantially between
+  // users and electrode placements. The filtered input suppresses brief noise.
+  ch1Threshold = ch1Rest + (ch1Max - ch1Rest) * 0.30f;
+  ch2Threshold = ch2Rest + (ch2Max - ch2Rest) * 0.35f;
+  Serial.printf("CH1: rest=%d max=%d threshold=%d\n", ch1Rest, ch1Max, ch1Threshold);
+  Serial.printf("CH2: rest=%d max=%d threshold=%d\n", ch2Rest, ch2Max, ch2Threshold);
+}
+
+void updateEMG() {
+  if (millis() - lastEmgSampleAt < EMG_SAMPLE_PERIOD_MS) return;
+  lastEmgSampleAt = millis();
+  // Light low-pass filtering prevents a single ADC spike from starting motion.
+  const int raw1 = readAverage(EMG_CH1);
+  const int raw2 = readAverage(EMG_CH2);
+  filteredCh1 = (filteredCh1 * 3 + raw1) / 4;
+  filteredCh2 = (filteredCh2 * 3 + raw2) / 4;
+}
+
+bool isOverCurrent() {
+  if (!ina219Available) return false;
+  const float current = ina219.getCurrent_mA();
+  if (isnan(current) || isinf(current)) return false;
+
+  if (fabsf(current) >= MAX_SAFE_CURRENT_MA) {
+    ++overCurrentSamples;
+  } else {
+    overCurrentSamples = 0;
+  }
+  if (overCurrentSamples >= CURRENT_TRIP_SAMPLES) {
+    Serial.printf("Emergency: over-current %.0f mA\n", current);
+    return true;
+  }
+  return false;
+}
+
+bool safetyStopRequested() {
+  if (filteredCh2 >= ch2Threshold) {
+    Serial.printf("Emergency: CH2 detected (%d)\n", filteredCh2);
+    return true;
+  }
+  return isOverCurrent();
+}
+
+void beginReturn(const char *reason) {
+  if (state == State::RETURNING) return;
+  Serial.printf("%s: stopping and returning slowly.\n", reason);
+  targetAngle = HOME_ANGLE;
+  state = State::RETURNING;
+  // Do not wait a full step period after an emergency command.
+  lastStepAt = millis() - STEP_INTERVAL_MS;
+}
+
+bool allAtTarget() {
+  for (int i = 0; i < SERVO_COUNT; ++i)
+    if (currentAngle[i] != targetAngle) return false;
+  return true;
+}
+
+void moveOneStep() {
+  if (millis() - lastStepAt < STEP_INTERVAL_MS) return;
+  lastStepAt = millis();
+  for (int i = 0; i < SERVO_COUNT; ++i) {
+    if (currentAngle[i] < targetAngle) ++currentAngle[i];
+    else if (currentAngle[i] > targetAngle) --currentAngle[i];
+    servos[i].write(currentAngle[i]);
+  }
+}
 
 void setup() {
   Serial.begin(115200);
+  Wire.begin(23, 22); // GPIO 23 -> SDA, GPIO 22 -> SCL
+  analogReadResolution(12);
+  Wire.setTimeOut(10);
+  ina219Available = ina219.begin();
+  Serial.println(ina219Available ? "INA219 connected." : "WARNING: INA219 not found; current protection is unavailable.");
 
-  // 핀 모드 설정
-  pinMode(PIN_EMG_CH1, INPUT);
-  pinMode(PIN_EMG_CH2, INPUT);
-  pinMode(PIN_ANGLE_SENSOR, INPUT);
-
-  // 서보모터 초기화
   ESP32PWM::allocateTimer(0);
-  motor1.setPeriodHertz(50); // 표준 50Hz 서보
-  motor1.attach(PIN_SERVO, 500, 2400);
-  motor1.write(0); // 시작 시 Rest 위치 (0도)
-
-  // WiFi 연결
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("Connecting to Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(300);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  for (int i = 0; i < SERVO_COUNT; ++i) {
+    servos[i].setPeriodHertz(50);
+    // 1000..2000 us is the normal, safe 0..180-degree control range.
+    // The previous 500..2400 us range can force an MG92B into its end stops.
+    servos[i].attach(SERVO_PIN[i], 1000, 2000);
+    servos[i].write(HOME_ANGLE);
   }
-  Serial.println("\nConnected to Wi-Fi!");
 
-  // Firebase 설정
-  config.host = FIREBASE_HOST;
-  config.signer.tokens.legacy_token = FIREBASE_AUTH;
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
-
-  Serial.println("ESP32 Firmware Ready.");
+  calibrateEMG();
+  filteredCh1 = readAverage(EMG_CH1);
+  filteredCh2 = readAverage(EMG_CH2);
+  Serial.println("Ready. Contract CH1 to start.");
 }
 
 void loop() {
-  // 1. Firebase control 노드 동기화 (0.2초 마다)
-  static unsigned long last_db_check = 0;
-  if (millis() - last_db_check > 200) {
-    updateControlFromDB();
-    last_db_check = millis();
-  }
+  updateEMG();
 
-  // 2. 모드별 동작 수행
-  if (mode == "STOP") {
-    setMotorAngle(0); // 0도 복귀
-    if (is_triggered || is_cocontraction) {
-      is_triggered = false;
-      is_cocontraction = false;
-      Firebase.setBool(fbdo, "/users/USER_001/realtime/is_triggered", false);
-      Firebase.setBool(fbdo, "/users/USER_001/realtime/is_cocontraction", false);
-    }
-  } 
-  else if (mode == "TEST") {
-    runDailyTest();
-  } 
-  else if (mode == "TRAIN") {
-    runTraining();
-  }
-
-  delay(10); // 안정적인 스케줄링을 위한 짧은 딜레이
-}
-
-// ==========================================
-// 5. 세부 동작 함수 구현
-// ==========================================
-
-// 관절 각도 획득 (ADC 0~4095 -> Angle 0~90도 매핑)
-int readAngle() {
-  int raw = analogRead(PIN_ANGLE_SENSOR);
-  int angle = map(raw, 0, 4095, 0, 90);
-  return constrain(angle, 0, 90);
-}
-
-// 모터 구동 함수
-void setMotorAngle(int angle) {
-  angle = constrain(angle, 0, 90);
-  motor1.write(angle);
-}
-
-// Firebase의 control 노드 읽어오기
-void updateControlFromDB() {
-  if (Firebase.getString(fbdo, "/users/USER_001/control/mode")) {
-    mode = fbdo.stringValue();
-  }
-  if (Firebase.getInt(fbdo, "/users/USER_001/control/target_angle")) {
-    target_angle = fbdo.intValue();
-  }
-  if (Firebase.getInt(fbdo, "/users/USER_001/control/hold_time_sec")) {
-    hold_time_sec = fbdo.intValue();
-  }
-  if (Firebase.getInt(fbdo, "/users/USER_001/control/threshold_ch1")) {
-    threshold_ch1 = fbdo.intValue();
-  }
-  if (Firebase.getInt(fbdo, "/users/USER_001/control/flexor_limit")) {
-    flexor_limit = fbdo.intValue();
-  }
-}
-
-// 데일리 테스트 모드 구현
-void runDailyTest() {
-  Serial.println("[TEST MODE] Starting Daily Test...");
-  
-  // 1. Baseline 노이즈 측정 (2초간)
-  long sum_ch1 = 0, sum_ch2 = 0;
-  for (int i = 0; i < 20; i++) {
-    sum_ch1 += analogRead(PIN_EMG_CH1);
-    sum_ch2 += analogRead(PIN_EMG_CH2);
-    delay(100);
-  }
-  int baseline_ch1 = sum_ch1 / 20;
-  int baseline_ch2 = sum_ch2 / 20;
-
-  // 2. 환자의 자량 펴기 시도 모니터링 (경직 또는 근력 한계 측정)
-  int active_max_angle = 0;
-  unsigned long test_start = millis();
-  int last_angle = readAngle();
-  unsigned long plateau_start = millis();
-
-  while (millis() - test_start < 10000) { // 최대 10초간 검사
-    int current_ch2 = analogRead(PIN_EMG_CH2);
-    int current_angle = readAngle();
-
-    if (current_angle > active_max_angle) {
-      active_max_angle = current_angle;
-    }
-
-    // 조건 A: 굴곡근 경직 감지 (급증)
-    if (current_ch2 > (baseline_ch2 + 1000)) { 
-      Serial.println("[TEST] Spasm Detected!");
-      break;
-    }
-
-    // 조건 B: 근력 한계 (각도 정체 Plateau 2초 유지)
-    if (abs(current_angle - last_angle) <= 2) {
-      if (millis() - plateau_start > 2000) {
-        Serial.println("[TEST] Muscle Strength Plateau Reached.");
-        break;
+  switch (state) {
+    case State::WAIT_FOR_COMMAND:
+      if (millis() - lastEmgDebugAt >= EMG_DEBUG_PERIOD_MS) {
+        lastEmgDebugAt = millis();
+        Serial.printf("EMG CH1=%d/%d, CH2=%d/%d\n", filteredCh1, ch1Threshold,
+                      filteredCh2, ch2Threshold);
       }
-    } else {
-      last_angle = current_angle;
-      plateau_start = millis();
-    }
+      if (filteredCh1 >= ch1Threshold && filteredCh2 < ch2Threshold) {
+        Serial.println("CH1 detected: opening slowly.");
+        targetAngle = OPEN_ANGLE;
+        state = State::OPENING;
+        lastStepAt = millis() - STEP_INTERVAL_MS;
+      }
+      break;
 
-    delay(50);
-  }
+    case State::OPENING:
+      if (safetyStopRequested()) beginReturn("Safety stop");
+      else {
+        moveOneStep();
+        if (allAtTarget()) {
+          Serial.println("90 degrees reached: holding for 3 seconds.");
+          holdStartedAt = millis();
+          state = State::HOLDING;
+        }
+      }
+      break;
 
-  // 3. DB daily_tests 노드에 결과 업로드
-  String path = "/users/USER_001/daily_tests/2026-07-26"; // 예시 날짜
-  Firebase.setInt(fbdo, path + "/baseline_ch1", baseline_ch1);
-  Firebase.setInt(fbdo, path + "/baseline_ch2", baseline_ch2);
-  Firebase.setInt(fbdo, path + "/active_max_angle", active_max_angle);
+    case State::HOLDING:
+      // Safety is also checked while holding; no blocking delay is used.
+      if (safetyStopRequested()) beginReturn("Safety stop");
+      else if (millis() - holdStartedAt >= HOLD_TIME_MS) beginReturn("Hold complete");
+      break;
 
-  // 테스트 완료 후 자동으로 STOP 모드로 전환
-  Firebase.setString(fbdo, "/users/USER_001/control/mode", "STOP");
-  mode = "STOP";
-  Serial.println("[TEST MODE] Completed and Uploaded.");
-}
-
-// 재활 훈련 모드 구현
-void runTraining() {
-  int emg1 = analogRead(PIN_EMG_CH1);
-  int emg2 = analogRead(PIN_EMG_CH2);
-
-  // 1. 안전 장치: 굴곡근 경직(Co-contraction) 감지 시 비상 정지
-  if (emg2 > flexor_limit) {
-    if (!is_cocontraction) {
-      is_cocontraction = true;
-      Firebase.setBool(fbdo, "/users/USER_001/realtime/is_cocontraction", true);
-      Serial.println("⚠️ EMERGENCY: Co-contraction Detected!");
-    }
-    setMotorAngle(0); // 0도로 즉시 비상 복귀
-    return;
-  }
-
-  // 2. 신전근(CH1) 의지 감지 -> 모터 보조 구동
-  if (emg1 > threshold_ch1 && !is_triggered) {
-    is_triggered = true;
-    response_start_time = millis();
-    Firebase.setBool(fbdo, "/users/USER_001/realtime/is_triggered", true);
-    Serial.println(" Triggered! Motor moving to target_angle...");
-
-    // [핵심 제어] target_angle까지 모터 이동
-    setMotorAngle(target_angle);
-
-    // hold_time_sec (예: 3초) 동안 유지
-    delay(hold_time_sec * 1000);
-
-    // 천천히 0도로 복귀
-    setMotorAngle(0);
-
-    // 훈련 1회 완료 후 상태 리셋
-    is_triggered = false;
-    Firebase.setBool(fbdo, "/users/USER_001/realtime/is_triggered", false);
+    case State::RETURNING:
+      // CH2 remains an emergency condition, but return motion continues safely.
+      // A new high current is logged but must not prevent returning home.
+      if (isOverCurrent()) Serial.println("Warning: current high while returning.");
+      moveOneStep();
+      if (allAtTarget()) {
+        overCurrentSamples = 0;
+        state = State::WAIT_FOR_COMMAND;
+        Serial.println("Returned home. Ready.");
+      }
+      break;
   }
 }

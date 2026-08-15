@@ -1,0 +1,273 @@
+#include <Arduino.h>
+#include <ESP32Servo.h>     // ESP32 전용 서보 라이브러리
+#include <Wire.h>
+#include <Adafruit_INA219.h>
+
+// 1. 핀 번호 정의
+const int EMG_CH1 = 34; // 신전근 (손가락 펴기 의지)
+const int EMG_CH2 = 35; // 굴근 (동시수축 / 비상정지)
+const int SERVO_PIN[5] = { 13, 14, 27, 26, 25 }; 
+
+// 2. INA219 전류센서 객체 및 안전 기준치
+Adafruit_INA219 ina219;
+const float MAX_SAFE_CURRENT_MA = 2500.0; // 전체 모터 허용 최대 전류 (2.5A 이상 시 잼으로 판단)
+
+// 3. 근전도 임계값 (캘리브레이션으로 자동 계산됨)
+int THRESHOLD = 2400;           // CH1 동작 기준치 (기본값)
+int CoContractionTHRESHOLD = 2000; // CH2 동시수축 기준치 (기본값)
+
+// 4. 서보 모터 및 상태 변수
+Servo servo[5];
+int fingerMaxAngle[5] = {180, 180, 180, 180, 180};
+int currentTargetAngle[5] = {0, 0, 0, 0, 0};
+int currentAngle[5] = {0, 0, 0, 0, 0};
+unsigned long lastStepTime[5] = {0, 0, 0, 0, 0};
+int speedLevel[5] = {5, 5, 5, 5, 5}; 
+
+// 5. 시차 구동(Staggered Drive) 관련 변수
+const unsigned long MOTOR_STAGGER_OFFSET_MS = 100; // 모터 간 출발 간격 (100ms)
+unsigned long trainingStartTime = 0;               // 훈련 시작 시각
+
+enum SystemState { MODE_CALIBRATION, MODE_TRAINING_WAIT, MODE_TRAINING_RUN };
+SystemState currentState = MODE_CALIBRATION;
+
+
+// =========================================================
+// [자동 캘리브레이션] EMG 센서 노이즈 및 사용자 맞춤 임계값 설정
+// =========================================================
+void runAutoCalibration() {
+  Serial.println("\n=============================================");
+  Serial.println("  [EMG 자동 캘리브레이션 시작]");
+  Serial.println("=============================================");
+
+  // Step 1: 휴식기 측정
+  Serial.println(">> [1/3] 편안하게 힘을 빼고 2초간 대기하세요...");
+  delay(1000);
+  long ch1_rest_sum = 0, ch2_rest_sum = 0;
+  for (int i = 0; i < 50; i++) {
+    ch1_rest_sum += analogRead(EMG_CH1);
+    ch2_rest_sum += analogRead(EMG_CH2);
+    delay(20);
+  }
+  int ch1_rest = ch1_rest_sum / 50;
+  int ch2_rest = ch2_rest_sum / 50;
+
+  // Step 2: CH1 신전근 (손가락 펴기) 측정
+  Serial.println("\n>> [2/3] 손가락을 3초간 '쫙 펴는 힘'을 주세요!");
+  delay(1000);
+  int ch1_max = 0;
+  unsigned long startTime = millis();
+  while (millis() - startTime < 3000) {
+    int val = analogRead(EMG_CH1);
+    if (val > ch1_max) ch1_max = val;
+    delay(10);
+  }
+
+  // Step 3: CH2 굴근 (주먹 쥐기 / 동시수축) 측정
+  Serial.println("\n>> [3/3] 주먹을 3초간 '꽉 쥐는 힘'을 주세요!");
+  delay(1000);
+  int ch2_max = 0;
+  startTime = millis();
+  while (millis() - startTime < 3000) {
+    int val = analogRead(EMG_CH2);
+    if (val > ch2_max) ch2_max = val;
+    delay(10);
+  }
+
+  // Step 4: 50% MVC(최대 수축력) 지점으로 임계값 계산
+  THRESHOLD = ch1_rest + (ch1_max - ch1_rest) * 0.5;
+  CoContractionTHRESHOLD = ch2_rest + (ch2_max - ch2_rest) * 0.5;
+
+  Serial.println("\n>> 캘리브레이션 완료!");
+  Serial.printf("   - CH1 (신전근) : Rest=%d, Max=%d => 임계값: %d\n", ch1_rest, ch1_max, THRESHOLD);
+  Serial.printf("   - CH2 (동시수축): Rest=%d, Max=%d => 임계값: %d\n", ch2_rest, ch2_max, CoContractionTHRESHOLD);
+  Serial.println("=============================================\n");
+  delay(2000);
+}
+
+
+// 데일리 테스트 모드 (모터 동작 범위 체크)
+void runDailyTestMode() {
+  for (int i = 0; i < 5; i++) {
+    Serial.printf(">> %d번 손가락 테스트 시작\n", i + 1);
+    delay(500);
+    int angle;
+    for (angle = 0; angle < 180; angle++) {
+      servo[i].write(angle);
+      delay(20);
+    }
+    fingerMaxAngle[i] = angle; 
+    for (; angle >= 0; angle--) {
+      servo[i].write(angle);
+      delay(20);
+    }
+    speedLevel[i] = map(fingerMaxAngle[i], 0, 180, 1, 10);
+  }
+}
+
+
+void setup() {
+  Serial.begin(115200);
+
+  // 1. I2C 및 INA219 초기화
+  Wire.begin(21, 22); // ESP32 SDA=21, SCL=22
+  if (!ina219.begin()) {
+    Serial.println("⚠️ INA219 전류센서 연결 실패! 배선을 확인하세요.");
+  } else {
+    Serial.println("✅ INA219 전류센서 정상 연결됨.");
+  }
+
+  // ---------------------------------------------------------
+  // [수정된 부분] ESP32Servo 하드웨어 타이머 할당
+  // ---------------------------------------------------------
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  // 2. 서보 모터 초기화
+  for (int i = 0; i < 5; i++) {
+    servo[i].setPeriodHertz(50);                        // 표준 서보 주파수 50Hz 설정
+    servo[i].attach(SERVO_PIN[i], 500, 2400);           // 핀 번호 및 최소/최대 펄스폭 설정
+    servo[i].write(0); 
+  }
+  // ---------------------------------------------------------
+
+  Serial.println("\n== 시스템 초기화 완료 ==");
+  delay(1000);
+
+  // 3. EMG 자동 캘리브레이션 실행
+  runAutoCalibration();
+
+  // 4. 데일리 테스트 실행 (필요시 주석 해제)
+  // runDailyTestMode();
+
+  Serial.println(">> 테스트 모드 완료. 훈련 대기 상태로 전환합니다...");
+  currentState = MODE_TRAINING_WAIT; 
+}
+
+
+void startTrainingMode() {
+  trainingStartTime = millis(); // 시차 구동을 위한 기준 시간 저장
+  for (int i = 0; i < 5; i++) {
+    currentTargetAngle[i] = fingerMaxAngle[i]; 
+  }
+}
+
+
+// =========================================================
+// [개선된 모터 구동 함수] 시차 출발 + 과전류 잼 감지 기능
+// =========================================================
+bool driveMotorWithRamp(int motorIdx, int targetAngle[], int speedLevel[]) {
+  unsigned long now = millis();
+
+  // 1. 모터별 시차 출발 (Staggered Start) 체크
+  // i번째 모터는 (i * 100ms) 시간이 지난 후에 출발함
+  if (now - trainingStartTime < (motorIdx * MOTOR_STAGGER_OFFSET_MS)) {
+    return false; // 아직 출발 시간이 안 됨
+  }
+
+  if (currentAngle[motorIdx] == targetAngle[motorIdx]) {
+    return true; // 목표 각도 도달 완료
+  }
+
+  int stepDelay = map(speedLevel[motorIdx], 1, 10, 50, 5); 
+  
+  if (now - lastStepTime[motorIdx] < stepDelay) {
+    return false;
+  }
+
+  // 각도 변경
+  if (currentAngle[motorIdx] < targetAngle[motorIdx]) {
+    currentAngle[motorIdx]++;
+  } else {
+    currentAngle[motorIdx]--;
+  }
+  servo[motorIdx].write(currentAngle[motorIdx]);
+  lastStepTime[motorIdx] = now; 
+
+  // -------------------------------------------------------------
+  // [실시간 안전 검사] 1. 과전류 감지 (INA219) & 2. 동시수축 (EMG CH2)
+  // -------------------------------------------------------------
+  float current_mA = ina219.getCurrent_mA();
+  bool isCoContraction = (analogRead(EMG_CH2) > CoContractionTHRESHOLD);
+  bool isOverCurrent = (current_mA > MAX_SAFE_CURRENT_MA);
+
+  // 비상 멈춤 및 원위치 복귀 조건
+  if (isCoContraction || isOverCurrent) {
+    if (isOverCurrent) {
+      Serial.printf("⚠️ 과전류/모터 잼 감지! (현재 전류: %.1f mA) 원위치로 복귀합니다...\n", current_mA);
+    } else {
+      Serial.println(">> 동시수축 감지! 원위치로 복귀합니다...");
+    }
+
+    for (int i = 0; i < 5; i++) {
+      targetAngle[i] = 0; // 즉시 모든 손가락 0도 복귀 명령
+    }
+  }
+
+  return (currentAngle[motorIdx] == targetAngle[motorIdx]);
+}
+
+
+int checkTrainingCase(int currentAngle[], int targetAngle[]) {
+  bool allReached = true;
+  bool isMovingForward = false;
+  bool isReturning = false;
+
+  for (int i = 0; i < 5; i++) {
+    if (currentAngle[i] != targetAngle[i]) {
+      allReached = false;
+      if (currentAngle[i] < targetAngle[i]) isMovingForward = true;
+      else if (currentAngle[i] > targetAngle[i]) isReturning = true;
+    }
+  }
+  
+  if (allReached) return 0;
+  if (isMovingForward) return 1;
+  if (isReturning) return 2;
+  return -1;
+}
+
+
+void loop() {
+  // 1. 훈련 대기 상태
+  if (currentState == MODE_TRAINING_WAIT) {
+    if (analogRead(EMG_CH1) >= THRESHOLD) {
+      Serial.println(">> 의지 감지! 훈련을 시작합니다...");
+      startTrainingMode();
+      currentState = MODE_TRAINING_RUN;
+    }
+  }
+
+  // 2. 훈련 진행 상태
+  else if (currentState == MODE_TRAINING_RUN) {
+    
+    // 5개 모터 구동 (내부에서 시차 적용 및 과전류 감지)
+    for (int i = 0; i < 5; i++) {
+      driveMotorWithRamp(i, currentTargetAngle, speedLevel);
+    }
+
+    int trainState = checkTrainingCase(currentAngle, currentTargetAngle);
+
+    // [Case 0] 5개 모터 모두 목표 각도 도달 시
+    if (trainState == 0) {
+      // 손가락을 다 펼친 경우
+      if (currentAngle[0] == fingerMaxAngle[0] && fingerMaxAngle[0] > 0) {
+        Serial.println(">> 목표 각도 도달! 3초간 유지합니다...");
+        delay(3000); 
+
+        Serial.println(">> 원위치로 복귀를 시작합니다.");
+        trainingStartTime = millis(); // 복귀 시에도 시차 적용
+        for (int i = 0; i < 5; i++) {
+          currentTargetAngle[i] = 0; 
+        }
+      }
+      // 원위치(0도)로 모두 복귀 완료된 경우
+      else if (currentAngle[0] == 0) {
+        Serial.println(">> 원위치 복귀 완료!");
+        currentState = MODE_TRAINING_WAIT; 
+      }
+    }
+  }
+}
