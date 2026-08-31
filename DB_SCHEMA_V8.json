@@ -1,0 +1,93 @@
+{
+  "users": {
+    "{uid}": {
+      "profile": {
+        "name": "홍길동",
+        "email": "example@cau.ac.kr",
+        "created_at": 1718300000
+      },
+      "realtime": {
+        "protocol_version": 8,
+        "device_boot": 123456,
+        "sequence": 10,
+        "device_ms": 84020,
+        "status": {
+          "mode": "START",
+          "is_triggered": false,
+          "is_cocontraction": false,
+          "is_participation_low": false,
+          "battery": null,
+          "stall_detected": false
+        },
+        "angles": {
+          "thumb": 0,
+          "index": 0,
+          "middle": 0,
+          "ring": 0,
+          "pinky": 0
+        },
+        "target_angles": {
+          "thumb": 84,
+          "index": 92,
+          "middle": 95,
+          "ring": 81,
+          "pinky": 76
+        },
+        "emg": {
+          "ch1": 1024,
+          "ch2": 980
+        },
+        "control": {
+          "mode": "START",
+          "target_angle": 90,
+          "hold_time_sec": 3,
+          "motor_level": 3,
+          "threshold_extensor": 800,
+          "threshold_flexor": 800,
+          "mvc_extensor": 900,
+          "mvc_flexor": 900,
+          "participation_required": 0.126
+        },
+        "timestamp": 1724378974
+      },
+      "training_logs": {
+        "session_123456_1": {
+          "protocol_version": 8,
+          "device_boot": 123456,
+          "device_session_id": 1,
+          "final_sequence": 20,
+          "selected_finger_mask": 31,
+          "end_reason": "GOAL",
+          "date": "2026-08-29",
+          "start_time": 1787932800,
+          "end_time": 1787936400,
+          "device_start_ms": 90210,
+          "device_end_ms": 105000,
+          "total_attempts": 7,
+          "success_count": 5,
+          "participation_failure_count": 2,
+          "cocontraction_cnt": 0,
+          "average_angle": 60.5,
+          "success_rate": 71.4,
+          "current_safety_count": 1,
+          "max_extensor_rms": 1000,
+          "max_flexor_rms": 1000
+        }
+      },
+      "progress": {
+        "daily": {
+          "2026-08-29": {
+            "total_sessions": 2,
+            "avg_success_rate": 88.5
+          }
+        },
+        "weekly": {
+          "2026-W35": {
+            "total_sessions": 10,
+            "avg_success_rate": 85.0
+          }
+        }
+      }
+    }
+  }
+}

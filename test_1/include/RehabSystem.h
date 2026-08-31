@@ -1,6 +1,6 @@
 #pragma once
 
-#include "BleManager.h"
+#include "KeyboardCommandInput.h"
 #include "Config.h"
 #include "CurrentSensor.h"
 #include "EmgSensor.h"
@@ -58,7 +58,9 @@ private:
   ServoManager servo;
   CurrentSensor currentSensor;
   EmgSensor emgSensor;
-  BleManager ble;
+  // Retain the original member name so the rehabilitation state machine uses
+  // exactly the same command path as the app-driven firmware.
+  KeyboardCommandInput ble;
 
   SystemState currentState;
   SystemState safetyReturnDestination;
