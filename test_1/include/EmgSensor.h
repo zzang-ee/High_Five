@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <esp_adc_cal.h>
 #include <esp_timer.h>
 
 #include "freertos/FreeRTOS.h"
@@ -25,6 +26,9 @@ public:
     bool consumeSamplingGap();
     bool consumeFeatureGap();
     uint32_t getMissedRawSampleCount() const;
+    bool hasValidBatteryReading() const;
+    uint8_t getBatteryPercent() const;
+    float getBatteryVoltage() const;
 
     float getExtensorRMS() const { return extensorRMS; }
     float getFlexorRMS() const { return flexorRMS; }
@@ -110,6 +114,12 @@ private:
     uint16_t validSampleCount;
     uint16_t samplesSinceFeature;
     uint64_t lastRawSampleTimeUs;
+    esp_adc_cal_characteristics_t batteryAdcCharacteristics;
+    uint64_t lastBatterySampleTimeUs;
+    uint32_t batteryRawSum;
+    uint8_t batteryRawSampleCount;
+    float filteredBatteryVoltage;
+    bool batteryFilterInitialized;
 
     // Cross-core snapshot and commands. Every access is protected by dataMux.
     mutable portMUX_TYPE dataMux = portMUX_INITIALIZER_UNLOCKED;
@@ -122,11 +132,15 @@ private:
     bool publishedSignalQualityGood;
     uint32_t publishedSequence;
     uint32_t publishedLastFeatureTimeMs;
+    float publishedBatteryVoltage;
+    uint8_t publishedBatteryPercent;
+    bool publishedBatteryValid;
 
     static void samplingTimerCallback(void* argument);
     static void samplingTaskEntry(void* argument);
     void samplingLoop();
     void processRawPair(int extensorRaw, int flexorRaw);
+    void sampleBattery(uint64_t nowUs);
     void resetProcessingState();
     void publishFeature();
 
@@ -144,6 +158,7 @@ private:
                                                float a1,
                                                float a2);
     static bool isSaturated(int rawValue);
+    static uint8_t calculateBatteryPercent(float packVoltage);
     static float normalizeActivation(float rms, float threshold, float maximum);
     static bool isValidCalibrationValue(float value);
 };

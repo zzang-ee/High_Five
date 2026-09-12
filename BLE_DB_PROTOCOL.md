@@ -83,15 +83,21 @@ DB idempotency key는 `boot + sid`이다. `sid`만 사용하면 재부팅 뒤의
     "is_triggered": true,
     "is_cocontraction": false,
     "is_participation_low": false,
-    "battery": null,
+    "battery": 85,
     "stall_detected": false
   }
 }
 ```
 
 `stall_detected`는 v8에서 전류 안전 상태를 뜻하며 훈련 실패를 뜻하지
-않는다. 현재 하드웨어에는 배터리 잔량 입력이 없으므로 `battery`는
-`null`이다.
+않는다. `battery`는 2S LiPo의 추정 잔량(0~100 정수)이다. GPIO32의
+배터리 분압 입력이 아직 준비되지 않았거나 측정 전압이 유효 범위를
+벗어나면 `null`이다. 서보 구동 중 전압 강하로 표시가 흔들리지 않도록
+홈 위치에서 얻은 최신 잔량을 훈련 중에도 유지한다.
+
+배터리 측정 회로는 `배터리+ -> 47 kΩ -> GPIO32 -> 22 kΩ -> GND`이며,
+22 kΩ과 병렬로 100 nF를 연결한다. 배터리 음극, ESP32 GND, 전류센서
+GND는 공통이어야 한다. 2S LiPo 전압을 GPIO32에 직접 연결하면 안 된다.
 
 ```json
 {

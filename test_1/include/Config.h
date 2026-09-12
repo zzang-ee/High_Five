@@ -25,6 +25,21 @@ constexpr uint32_t SERVO_HOME_SETTLE_MS = 300;
 constexpr uint8_t EMG_EXTENSOR_PIN = 34;
 constexpr uint8_t EMG_FLEXOR_PIN = 35;
 
+// 2S LiPo voltage monitor. Connect battery+ through 47 kohm to GPIO32 and
+// GPIO32 through 22 kohm to battery-/ESP32 GND. Place 100 nF in parallel with
+// the 22 kohm resistor. The ADC must never be connected to the battery
+// directly. At the 8.4 V pack maximum the ADC pin sees about 2.68 V.
+constexpr uint8_t BATTERY_ADC_PIN = 32;
+constexpr float BATTERY_DIVIDER_TOP_OHMS = 47000.0f;
+constexpr float BATTERY_DIVIDER_BOTTOM_OHMS = 22000.0f;
+constexpr uint32_t BATTERY_SUBSAMPLE_INTERVAL_US = 100000;
+constexpr uint8_t BATTERY_AVERAGE_SAMPLE_COUNT = 10;
+constexpr float BATTERY_FILTER_ALPHA = 0.25f;
+// Values outside this broad electrical plausibility window are reported as
+// JSON null. Percentage itself is clamped to the 2S usable range in firmware.
+constexpr float BATTERY_VALID_MIN_VOLTAGE = 5.5f;
+constexpr float BATTERY_VALID_MAX_VOLTAGE = 9.0f;
+
 // Wire.begin() takes SDA first and SCL second.
 constexpr uint8_t I2C_SCL_PIN = 22;
 constexpr uint8_t I2C_SDA_PIN = 23;
@@ -64,9 +79,10 @@ constexpr uint16_t EMG_RMS_WINDOW_MS = 250;
 constexpr uint16_t EMG_RMS_SAMPLE_COUNT =
     static_cast<uint16_t>((EMG_RAW_SAMPLE_RATE_HZ * EMG_RMS_WINDOW_MS) /
                           1000UL);
-// The sensor already contains an analogue 20 Hz high-pass section. A lower
-// digital corner removes its 1.5 V bias without attenuating 20 Hz twice.
-constexpr float EMG_HIGH_PASS_CUTOFF_HZ = 10.0f;
+// Match the sensor vendor's 20 Hz motion-artifact cutoff. Coefficients are
+// calculated for this project's 2 kHz sampling rate instead of copying the
+// vendor library's fixed 500/1000 Hz tables.
+constexpr float EMG_HIGH_PASS_CUTOFF_HZ = 20.0f;
 constexpr float EMG_LOW_PASS_CUTOFF_HZ = 450.0f;
 constexpr float EMG_NOTCH_FREQUENCY_HZ = 60.0f;
 constexpr float EMG_FILTER_Q = 0.70710678f;
@@ -205,6 +221,18 @@ static_assert(ROM_FINGER_CURRENT_RISE_LIMIT_MA[0] > 0.0f &&
 static_assert(EMG_RAW_SAMPLE_RATE_HZ >= 1000 &&
                   1000000UL % EMG_RAW_SAMPLE_RATE_HZ == 0,
               "EMG sample rate must be at least 1 kHz and divide 1 MHz");
+static_assert(BATTERY_ADC_PIN != EMG_EXTENSOR_PIN &&
+                  BATTERY_ADC_PIN != EMG_FLEXOR_PIN &&
+                  BATTERY_DIVIDER_TOP_OHMS > 0.0f &&
+                  BATTERY_DIVIDER_BOTTOM_OHMS > 0.0f &&
+                  BATTERY_SUBSAMPLE_INTERVAL_US >=
+                      EMG_RAW_SAMPLE_INTERVAL_US &&
+                  BATTERY_AVERAGE_SAMPLE_COUNT > 0 &&
+                  BATTERY_FILTER_ALPHA > 0.0f &&
+                  BATTERY_FILTER_ALPHA <= 1.0f &&
+                  BATTERY_VALID_MIN_VOLTAGE <
+                      BATTERY_VALID_MAX_VOLTAGE,
+              "Battery monitor configuration is invalid");
 static_assert(EMG_LOW_PASS_CUTOFF_HZ <
                   static_cast<float>(EMG_RAW_SAMPLE_RATE_HZ) * 0.5f,
               "EMG low-pass cutoff must be below Nyquist");

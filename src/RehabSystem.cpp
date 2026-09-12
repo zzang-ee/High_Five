@@ -86,7 +86,9 @@ RehabSystem::RehabSystem()
       completedTrainingEndReason(nullptr),
       lastTelemetryTime(0),
       telemetryFingerIndex(0),
-      lastControlLoopTime(0) {
+      lastControlLoopTime(0),
+      stableBatteryPercent(0),
+      stableBatteryReadingValid(false) {
   resetFingerProfiles();
 }
 
@@ -182,6 +184,16 @@ void RehabSystem::update() {
                             !emgSensor.isSamplingHealthy(nowMs) ||
                             emgQualityFault;
   const bool newCurrentSample = currentSensor.update(nowMs);
+
+  // Cache only a home/rest reading. Servo load can momentarily pull pack
+  // voltage down, which would otherwise make the app's percentage jump while
+  // a training trajectory is running.
+  if (!isActuationState() && servo.allAtHome()) {
+    stableBatteryReadingValid = emgSensor.hasValidBatteryReading();
+    if (stableBatteryReadingValid) {
+      stableBatteryPercent = emgSensor.getBatteryPercent();
+    }
+  }
 
   if (trainingSessionActive && newEmgSample && emgSensor.isWindowReady() &&
       emgSensor.isSignalQualityGood()) {
@@ -2452,12 +2464,18 @@ void RehabSystem::sendRealtimeTelemetry(uint32_t nowMs) {
        currentSensor.getCurrentmA() >=
            calculateGroupSoftCurrentLimit(enabledMask));
 
+  char batteryText[5] = "null";
+  if (stableBatteryReadingValid) {
+    snprintf(batteryText, sizeof(batteryText), "%u",
+             static_cast<unsigned>(stableBatteryPercent));
+  }
+
   char statusMessage[245];
   snprintf(statusMessage, sizeof(statusMessage),
            "{\"v\":%u,\"boot\":%lu,\"q\":%lu,\"device_ms\":%lu,"
            "\"status\":{\"mode\":\"%s\",\"is_triggered\":%s,"
            "\"is_cocontraction\":%s,\"is_participation_low\":%s,"
-           "\"battery\":null,"
+           "\"battery\":%s,"
            "\"stall_detected\":%s}}",
            BLE_PROTOCOL_VERSION, static_cast<unsigned long>(bootId), sequence,
            static_cast<unsigned long>(nowMs),
@@ -2465,6 +2483,7 @@ void RehabSystem::sendRealtimeTelemetry(uint32_t nowMs) {
            trainingTriggered ? "true" : "false",
            simultaneousActivation ? "true" : "false",
            participationWarningActive ? "true" : "false",
+           batteryText,
            stallDetected ? "true" : "false");
   ble.sendData(statusMessage);
 

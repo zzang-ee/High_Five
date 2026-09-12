@@ -150,6 +150,8 @@ private:
   uint32_t lastTelemetryTime;
   uint8_t telemetryFingerIndex;
   uint32_t lastControlLoopTime;
+  uint8_t stableBatteryPercent;
+  bool stableBatteryReadingValid;
 
   void handleBleCommand(String command, uint32_t nowMs);
   void handleSafetyCommand(BleSafetyCommand command, uint32_t nowMs);

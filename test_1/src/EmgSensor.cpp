@@ -8,11 +8,27 @@
 
 namespace {
 constexpr float PI_VALUE = 3.14159265358979323846f;
+constexpr uint32_t ADC_DEFAULT_VREF_MV = 1100;
 constexpr adc1_channel_t EXTENSOR_ADC_CHANNEL = ADC1_CHANNEL_6;
 constexpr adc1_channel_t FLEXOR_ADC_CHANNEL = ADC1_CHANNEL_7;
+constexpr adc1_channel_t BATTERY_ADC_CHANNEL = ADC1_CHANNEL_4;
+
+constexpr float BATTERY_VOLTAGE_POINTS[] = {
+    6.60f, 6.80f, 7.00f, 7.20f, 7.40f,
+    7.60f, 7.80f, 8.00f, 8.20f, 8.40f};
+constexpr uint8_t BATTERY_PERCENT_POINTS[] = {
+    0, 5, 10, 20, 35, 50, 65, 80, 90, 100};
+constexpr size_t BATTERY_POINT_COUNT =
+    sizeof(BATTERY_VOLTAGE_POINTS) / sizeof(BATTERY_VOLTAGE_POINTS[0]);
 
 static_assert(EMG_EXTENSOR_PIN == 34 && EMG_FLEXOR_PIN == 35,
               "Direct ADC1 channel mapping requires EMG pins 34 and 35");
+static_assert(BATTERY_ADC_PIN == 32,
+              "Direct ADC1 channel mapping requires battery pin 32");
+static_assert(BATTERY_POINT_COUNT ==
+                  sizeof(BATTERY_PERCENT_POINTS) /
+                      sizeof(BATTERY_PERCENT_POINTS[0]),
+              "Battery voltage and percentage tables must match");
 
 uint16_t calculateAllowedSaturatedSamples(uint16_t sampleCount) {
     const float allowed =
@@ -53,6 +69,12 @@ EmgSensor::EmgSensor()
       validSampleCount(0),
       samplesSinceFeature(0),
       lastRawSampleTimeUs(0),
+      batteryAdcCharacteristics{},
+      lastBatterySampleTimeUs(0),
+      batteryRawSum(0),
+      batteryRawSampleCount(0),
+      filteredBatteryVoltage(0.0f),
+      batteryFilterInitialized(false),
       resetRequested(false),
       samplingGapLatched(false),
       missedRawSamples(0),
@@ -61,7 +83,10 @@ EmgSensor::EmgSensor()
       publishedWindowReady(false),
       publishedSignalQualityGood(false),
       publishedSequence(0),
-      publishedLastFeatureTimeMs(0) {}
+      publishedLastFeatureTimeMs(0),
+      publishedBatteryVoltage(0.0f),
+      publishedBatteryPercent(0),
+      publishedBatteryValid(false) {}
 
 bool EmgSensor::begin() {
     if (initialized) {
@@ -73,14 +98,21 @@ bool EmgSensor::begin() {
         adc1_config_channel_atten(EXTENSOR_ADC_CHANNEL, ADC_ATTEN_DB_12);
     const esp_err_t flexorAdcResult =
         adc1_config_channel_atten(FLEXOR_ADC_CHANNEL, ADC_ATTEN_DB_12);
+    const esp_err_t batteryAdcResult =
+        adc1_config_channel_atten(BATTERY_ADC_CHANNEL, ADC_ATTEN_DB_12);
     if (widthResult != ESP_OK || extensorAdcResult != ESP_OK ||
-        flexorAdcResult != ESP_OK) {
-        Serial.printf("ERR:EMG_ADC_CONFIG:%d,%d,%d\n",
+        flexorAdcResult != ESP_OK || batteryAdcResult != ESP_OK) {
+        Serial.printf("ERR:ADC_CONFIG:%d,%d,%d,%d\n",
                       static_cast<int>(widthResult),
                       static_cast<int>(extensorAdcResult),
-                      static_cast<int>(flexorAdcResult));
+                      static_cast<int>(flexorAdcResult),
+                      static_cast<int>(batteryAdcResult));
         return false;
     }
+
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12,
+                             ADC_DEFAULT_VREF_MV,
+                             &batteryAdcCharacteristics);
 
     highPassCoefficients = makeHighPass(EMG_HIGH_PASS_CUTOFF_HZ,
                                         EMG_FILTER_Q);
@@ -136,8 +168,14 @@ bool EmgSensor::begin() {
     }
 
     initialized = true;
-    Serial.printf("EMG: raw=%luHz, RMS=%ums, feature=%lums\n",
+    Serial.printf(
+        "EMG: raw=%luHz, band=%.0f-%.0fHz, notch=%.0fHz/Q%.0f, "
+        "RMS=%ums, feature=%lums\n",
                   static_cast<unsigned long>(EMG_RAW_SAMPLE_RATE_HZ),
+                  EMG_HIGH_PASS_CUTOFF_HZ,
+                  EMG_LOW_PASS_CUTOFF_HZ,
+                  EMG_NOTCH_FREQUENCY_HZ,
+                  EMG_NOTCH_Q,
                   static_cast<unsigned int>(EMG_RMS_WINDOW_MS),
                   static_cast<unsigned long>(EMG_FEATURE_INTERVAL_MS));
     return true;
@@ -226,6 +264,27 @@ bool EmgSensor::isSamplingHealthy(uint32_t nowMs) const {
 uint32_t EmgSensor::getMissedRawSampleCount() const {
     portENTER_CRITICAL(&dataMux);
     const uint32_t result = missedRawSamples;
+    portEXIT_CRITICAL(&dataMux);
+    return result;
+}
+
+bool EmgSensor::hasValidBatteryReading() const {
+    portENTER_CRITICAL(&dataMux);
+    const bool result = publishedBatteryValid;
+    portEXIT_CRITICAL(&dataMux);
+    return result;
+}
+
+uint8_t EmgSensor::getBatteryPercent() const {
+    portENTER_CRITICAL(&dataMux);
+    const uint8_t result = publishedBatteryPercent;
+    portEXIT_CRITICAL(&dataMux);
+    return result;
+}
+
+float EmgSensor::getBatteryVoltage() const {
+    portENTER_CRITICAL(&dataMux);
+    const float result = publishedBatteryVoltage;
     portEXIT_CRITICAL(&dataMux);
     return result;
 }
@@ -365,6 +424,9 @@ void EmgSensor::samplingLoop() {
 
         processRawPair(adc1_get_raw(EXTENSOR_ADC_CHANNEL),
                        adc1_get_raw(FLEXOR_ADC_CHANNEL));
+        // GPIO32 is read by this same task so battery monitoring can never
+        // race the 2 kHz EMG accesses to the shared ADC1 peripheral.
+        sampleBattery(nowUs);
     }
 }
 
@@ -423,6 +485,76 @@ void EmgSensor::processRawPair(int extensorRaw, int flexorRaw) {
         samplesSinceFeature = 0;
         publishFeature();
     }
+}
+
+void EmgSensor::sampleBattery(uint64_t nowUs) {
+    if (lastBatterySampleTimeUs != 0 &&
+        nowUs - lastBatterySampleTimeUs < BATTERY_SUBSAMPLE_INTERVAL_US) {
+        return;
+    }
+    lastBatterySampleTimeUs = nowUs;
+
+    const int raw = adc1_get_raw(BATTERY_ADC_CHANNEL);
+    if (raw < 0 || raw > ADC_MAX_VALUE) {
+        batteryRawSum = 0;
+        batteryRawSampleCount = 0;
+        batteryFilterInitialized = false;
+        portENTER_CRITICAL(&dataMux);
+        publishedBatteryValid = false;
+        publishedBatteryVoltage = 0.0f;
+        publishedBatteryPercent = 0;
+        portEXIT_CRITICAL(&dataMux);
+        return;
+    }
+
+    batteryRawSum += static_cast<uint32_t>(raw);
+    ++batteryRawSampleCount;
+    if (batteryRawSampleCount < BATTERY_AVERAGE_SAMPLE_COUNT) {
+        return;
+    }
+
+    const uint32_t averagedRaw =
+        batteryRawSum / static_cast<uint32_t>(batteryRawSampleCount);
+    batteryRawSum = 0;
+    batteryRawSampleCount = 0;
+
+    const uint32_t dividerMillivolts =
+        esp_adc_cal_raw_to_voltage(averagedRaw, &batteryAdcCharacteristics);
+    const float dividerRatio =
+        (BATTERY_DIVIDER_TOP_OHMS + BATTERY_DIVIDER_BOTTOM_OHMS) /
+        BATTERY_DIVIDER_BOTTOM_OHMS;
+    const float measuredPackVoltage =
+        (static_cast<float>(dividerMillivolts) / 1000.0f) * dividerRatio;
+    const bool valid =
+        std::isfinite(measuredPackVoltage) &&
+        measuredPackVoltage >= BATTERY_VALID_MIN_VOLTAGE &&
+        measuredPackVoltage <= BATTERY_VALID_MAX_VOLTAGE;
+
+    if (!valid) {
+        batteryFilterInitialized = false;
+        portENTER_CRITICAL(&dataMux);
+        publishedBatteryValid = false;
+        publishedBatteryVoltage = 0.0f;
+        publishedBatteryPercent = 0;
+        portEXIT_CRITICAL(&dataMux);
+        return;
+    }
+
+    if (!batteryFilterInitialized) {
+        filteredBatteryVoltage = measuredPackVoltage;
+        batteryFilterInitialized = true;
+    } else {
+        filteredBatteryVoltage =
+            BATTERY_FILTER_ALPHA * measuredPackVoltage +
+            (1.0f - BATTERY_FILTER_ALPHA) * filteredBatteryVoltage;
+    }
+
+    const uint8_t percent = calculateBatteryPercent(filteredBatteryVoltage);
+    portENTER_CRITICAL(&dataMux);
+    publishedBatteryVoltage = filteredBatteryVoltage;
+    publishedBatteryPercent = percent;
+    publishedBatteryValid = true;
+    portEXIT_CRITICAL(&dataMux);
 }
 
 void EmgSensor::resetProcessingState() {
@@ -575,6 +707,31 @@ bool EmgSensor::isSaturated(int rawValue) {
            rawValue >=
                static_cast<int>(ADC_MAX_VALUE -
                                 EMG_ADC_RAIL_MARGIN_COUNTS);
+}
+
+uint8_t EmgSensor::calculateBatteryPercent(float packVoltage) {
+    if (!std::isfinite(packVoltage) ||
+        packVoltage <= BATTERY_VOLTAGE_POINTS[0]) {
+        return 0;
+    }
+    if (packVoltage >= BATTERY_VOLTAGE_POINTS[BATTERY_POINT_COUNT - 1U]) {
+        return 100;
+    }
+
+    for (size_t i = 1; i < BATTERY_POINT_COUNT; ++i) {
+        if (packVoltage <= BATTERY_VOLTAGE_POINTS[i]) {
+            const float lowerVoltage = BATTERY_VOLTAGE_POINTS[i - 1U];
+            const float upperVoltage = BATTERY_VOLTAGE_POINTS[i];
+            const float fraction =
+                (packVoltage - lowerVoltage) /
+                (upperVoltage - lowerVoltage);
+            const float lowerPercent = BATTERY_PERCENT_POINTS[i - 1U];
+            const float upperPercent = BATTERY_PERCENT_POINTS[i];
+            return static_cast<uint8_t>(lroundf(
+                lowerPercent + fraction * (upperPercent - lowerPercent)));
+        }
+    }
+    return 100;
 }
 
 float EmgSensor::normalizeActivation(float rms,

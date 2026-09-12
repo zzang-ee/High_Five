@@ -16,7 +16,7 @@
           "is_triggered": false,
           "is_cocontraction": false,
           "is_participation_low": false,
-          "battery": null,
+          "battery": 85,
           "stall_detected": false
         },
         "angles": {
