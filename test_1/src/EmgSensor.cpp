@@ -322,10 +322,10 @@ bool EmgSensor::hasValidCalibration() const {
            isValidCalibrationValue(extensorMax) &&
            isValidCalibrationValue(flexorMax) &&
            extensorMax - extensorThreshold >=
-               fmaxf(EMG_MIN_CALIBRATION_SPAN,
+               fmaxf(EMG_EXTENSOR_MIN_CALIBRATION_SPAN,
                      extensorThreshold * EMG_MIN_CALIBRATION_SPAN_RATIO) &&
            flexorMax - flexorThreshold >=
-               fmaxf(EMG_MIN_CALIBRATION_SPAN,
+               fmaxf(EMG_FLEXOR_MIN_CALIBRATION_SPAN,
                      flexorThreshold * EMG_MIN_CALIBRATION_SPAN_RATIO);
 }
 
@@ -343,14 +343,16 @@ float EmgSensor::getExtensorActivation() const {
     if (!windowReady || !signalQualityGood) {
         return 0.0f;
     }
-    return normalizeActivation(extensorRMS, extensorThreshold, extensorMax);
+    return normalizeActivation(extensorRMS, extensorThreshold, extensorMax,
+                               EMG_EXTENSOR_MIN_CALIBRATION_SPAN);
 }
 
 float EmgSensor::getFlexorActivation() const {
     if (!windowReady || !signalQualityGood) {
         return 0.0f;
     }
-    return normalizeActivation(flexorRMS, flexorThreshold, flexorMax);
+    return normalizeActivation(flexorRMS, flexorThreshold, flexorMax,
+                               EMG_FLEXOR_MIN_CALIBRATION_SPAN);
 }
 
 void EmgSensor::samplingTimerCallback(void* argument) {
@@ -736,10 +738,11 @@ uint8_t EmgSensor::calculateBatteryPercent(float packVoltage) {
 
 float EmgSensor::normalizeActivation(float rms,
                                      float threshold,
-                                     float maximum) {
+                                     float maximum,
+                                     float minimumSpan) {
     const float span = maximum - threshold;
     const float requiredSpan =
-        fmaxf(EMG_MIN_CALIBRATION_SPAN,
+        fmaxf(minimumSpan,
               threshold * EMG_MIN_CALIBRATION_SPAN_RATIO);
     if (!std::isfinite(rms) || !std::isfinite(span) ||
         span < requiredSpan) {

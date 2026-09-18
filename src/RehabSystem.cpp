@@ -608,7 +608,7 @@ void RehabSystem::processEmgCalibration(uint32_t nowMs,
     emgSensor.setExtensorMax(
         calculateRobustMvc(calibrationExtensorSamples, sampleCount));
     if (emgSensor.getExtensorMVC() - emgSensor.getExtensorThreshold() <
-        fmaxf(EMG_MIN_CALIBRATION_SPAN,
+        fmaxf(EMG_EXTENSOR_MIN_CALIBRATION_SPAN,
               emgSensor.getExtensorThreshold() *
                   EMG_MIN_CALIBRATION_SPAN_RATIO)) {
       retryEmgCalibrationStage("extensor_mvc_invalid", nowMs);
@@ -1353,10 +1353,9 @@ void RehabSystem::processTraining(uint32_t nowMs,
   }
 
   if (trainingPhase == TrainingPhase::STALL_CONFIRMING) {
-    if (isCocontractionConfirmed(nowMs, newEmgSample) ||
-        (emgSensor.isWindowReady() &&
-         emgSensor.getFlexorActivation() >=
-             COCONTRACTION_FLEXOR_LEVEL)) {
+    // Do not bypass the time-qualified CH1+CH2 rule just because current is
+    // also being confirmed. A single CH2 peak is not cocontraction.
+    if (isCocontractionConfirmed(nowMs, newEmgSample)) {
       if (sessionCocontractionCnt < UINT16_MAX) {
         ++sessionCocontractionCnt;
       }
@@ -2452,11 +2451,13 @@ void RehabSystem::sendRealtimeTelemetry(uint32_t nowMs) {
       trainingSessionActive ? trainingMask : selectedFingerMask;
   const uint8_t enabledMask = servo.getEnabledMask();
   const bool simultaneousActivation =
-      emgSensor.isWindowReady() &&
+      cocontractionPending && emgSensor.isWindowReady() &&
       emgSensor.getExtensorActivation() >=
           COCONTRACTION_EXTENSOR_LEVEL &&
       emgSensor.getFlexorActivation() >=
-          COCONTRACTION_FLEXOR_LEVEL;
+          COCONTRACTION_FLEXOR_LEVEL &&
+      static_cast<uint32_t>(nowMs - cocontractionStartTime) >=
+          COCONTRACTION_HOLD_MS;
   const bool stallDetected =
       (currentState == SystemState::TRAINING_ACTIVE &&
        trainingPhase == TrainingPhase::STALL_CONFIRMING) ||

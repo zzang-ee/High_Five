@@ -159,6 +159,7 @@ private:
                                                float a2);
     static bool isSaturated(int rawValue);
     static uint8_t calculateBatteryPercent(float packVoltage);
-    static float normalizeActivation(float rms, float threshold, float maximum);
+    static float normalizeActivation(float rms, float threshold, float maximum,
+                                     float minimumSpan);
     static bool isValidCalibrationValue(float value);
 };

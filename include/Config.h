@@ -98,7 +98,12 @@ constexpr float EMG_REST_ROBUST_SIGMA_MULTIPLIER = 3.0f;
 constexpr float EMG_MAD_TO_SIGMA_SCALE = 1.4826f;
 constexpr float EMG_REST_NOISE_PERCENTILE = 0.95f;
 constexpr float EMG_MVC_TOP_FRACTION = 0.10f;
-constexpr float EMG_MIN_CALIBRATION_SPAN = 20.0f;
+// CH1 remains strict because it drives the training trigger/participation
+// decision. Recent repeated CH2 logs showed a stable 13-15 ADC rest-to-flexion
+// span, so CH2 uses a lower absolute floor while retaining the same relative
+// separation requirement. This still rejects the 8.86 ADC weak-signal case.
+constexpr float EMG_EXTENSOR_MIN_CALIBRATION_SPAN = 20.0f;
+constexpr float EMG_FLEXOR_MIN_CALIBRATION_SPAN = 10.0f;
 constexpr float EMG_MIN_CALIBRATION_SPAN_RATIO = 0.25f;
 
 constexpr uint32_t CURRENT_SAMPLE_INTERVAL_MS = 10;
@@ -149,8 +154,8 @@ constexpr float TRAIN_TRIGGER_ACTIVATION = 0.15f;
 constexpr uint32_t TRAIN_RELEASE_HOLD_MS = 300;
 constexpr float TRAIN_RELEASE_ACTIVATION = 0.05f;
 constexpr float COCONTRACTION_EXTENSOR_LEVEL = 0.20f;
-constexpr float COCONTRACTION_FLEXOR_LEVEL = 0.35f;
-constexpr uint32_t COCONTRACTION_HOLD_MS = 200;
+constexpr float COCONTRACTION_FLEXOR_LEVEL = 0.90f;
+constexpr uint32_t COCONTRACTION_HOLD_MS = 1000;
 
 // Every assistance level uses the same trajectory duration. Levels change
 // only the CH1 participation requirement below; they never make the motor
@@ -262,6 +267,17 @@ static_assert(EMG_REST_NOISE_PERCENTILE > 0.5f &&
                   EMG_MVC_TOP_FRACTION > 0.0f &&
                   EMG_MVC_TOP_FRACTION <= 0.5f,
               "EMG robust calibration fractions are invalid");
+static_assert(EMG_EXTENSOR_MIN_CALIBRATION_SPAN >=
+                      EMG_FLEXOR_MIN_CALIBRATION_SPAN &&
+                  EMG_FLEXOR_MIN_CALIBRATION_SPAN > 0.0f &&
+                  EMG_MIN_CALIBRATION_SPAN_RATIO > 0.0f,
+              "Channel-specific EMG calibration spans are invalid");
+static_assert(COCONTRACTION_EXTENSOR_LEVEL > 0.0f &&
+                  COCONTRACTION_EXTENSOR_LEVEL <= 1.0f &&
+                  COCONTRACTION_FLEXOR_LEVEL > 0.0f &&
+                  COCONTRACTION_FLEXOR_LEVEL <= 1.0f &&
+                  COCONTRACTION_HOLD_MS > 0,
+              "Cocontraction confirmation settings are invalid");
 static_assert(EMG_CALIBRATION_FEATURE_COUNT > 0,
               "EMG calibration feature count is invalid");
 static_assert(CALIBRATION_COLLECTION_TIMEOUT_MS > CALIBRATION_DURATION_MS,
