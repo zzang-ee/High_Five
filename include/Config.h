@@ -119,10 +119,10 @@ constexpr float EMG_MVC_TOP_FRACTION = 0.10f;
 // the rest-noise threshold and relative separation check unchanged. This
 // accepts a 15-count rest-to-MVC span instead of requiring 20 counts when
 // the 25% relative check is smaller; sustained trigger checks still apply.
-// Recent repeated CH2 logs showed a stable 13-15 ADC rest-to-flexion span,
-// so CH2 retains its separate lower absolute floor.
+// CH2 flexion can be only 10-20 RMS counts above a 0-10 count rest range.
+// Keep a positive rest-to-MVC separation but do not require a 10-count span.
 constexpr float EMG_EXTENSOR_MIN_CALIBRATION_SPAN = 15.0f;
-constexpr float EMG_FLEXOR_MIN_CALIBRATION_SPAN = 10.0f;
+constexpr float EMG_FLEXOR_MIN_CALIBRATION_SPAN = 5.0f;
 constexpr float EMG_MIN_CALIBRATION_SPAN_RATIO = 0.25f;
 
 constexpr uint32_t CURRENT_SAMPLE_INTERVAL_MS = 10;
@@ -170,12 +170,18 @@ constexpr uint8_t ROM_LOAD_RISE_CONFIRM_SAMPLES = 3;
 // CSV-like Serial output is intentionally enabled while the ROM/training rise
 // limits above are being measured. Disable it after bench values are fixed.
 constexpr bool CURRENT_DIAGNOSTICS_ENABLED = true;
+// During the instructed 5 s CH1 contraction, a median normalized activation
+// of 0.60 or higher starts at assistance level 1. A low sustained fraction
+// starts higher; passive ROM EMG is deliberately excluded from this score.
 constexpr float ASSISTANCE_TARGET_ACTIVATION = 0.60f;
-constexpr float ASSISTANCE_RELATIVE_SPREAD_FULL = 0.20f;
 
 // Training -----------------------------------------------------------------
 constexpr uint32_t TRAIN_TRIGGER_HOLD_MS = 300;
 constexpr float TRAIN_TRIGGER_ACTIVATION = 0.15f;
+// High-assistance levels need less voluntary CH1 activity to initiate help.
+// The same level-scaled rise above the learned resting baseline is required,
+// so lowering this value does not permit a stationary rest signal to trigger.
+constexpr float TRAIN_TRIGGER_LEVEL_10_ACTIVATION = 0.08f;
 // Electrode contact and the RMS noise floor can drift after calibration.
 // Learn a fresh relaxed CH1 baseline before every cycle, then require a clear
 // rise above that local baseline. This prevents a low calibration threshold
@@ -187,20 +193,23 @@ constexpr float TRAIN_TRIGGER_ABOVE_REST_ACTIVATION = 0.15f;
 // this hysteresis for a short time, then wait for the next rising edge.
 constexpr uint32_t TRAIN_REARM_HOLD_MS = 300;
 constexpr float TRAIN_REARM_HYSTERESIS = 0.05f;
-constexpr float COCONTRACTION_EXTENSOR_LEVEL = 0.20f;
-// During training, CH2 must reach this fraction of its calibrated
-// rest-to-MVC range for the full confirmation time below. Start with 60%;
-// increase it if normal extension repeatedly causes false cocontraction.
-constexpr float COCONTRACTION_FLEXOR_LEVEL = 0.60f;
-constexpr uint32_t COCONTRACTION_HOLD_MS = 1000;
+constexpr float COCONTRACTION_EXTENSOR_LEVEL = 0.15f;
+// A weak but valid CH2 signal may not reach 60% of its own rest-to-MVC span.
+// Require simultaneous CH1+CH2 activation for 600 ms. When measured group
+// current is also near the group reference value, 100 ms of both EMG
+// channels is enough to classify resistance. Hard overcurrent is unchanged.
+constexpr float COCONTRACTION_FLEXOR_LEVEL = 0.35f;
+constexpr uint32_t COCONTRACTION_HOLD_MS = 600;
+constexpr uint32_t ROM_COCONTRACTION_HOLD_MS = 1000;
+constexpr float COCONTRACTION_CURRENT_SUPPORT_FRACTION = 0.90f;
+constexpr uint32_t COCONTRACTION_CURRENT_HOLD_MS = 100;
 // Keep the stricter CH2 limits for starting a cycle and for passive ROM;
 // lowering the training detector must not make either phase harder to enter.
 constexpr float TRAIN_TRIGGER_FLEXOR_VETO_LEVEL = 0.90f;
 constexpr float ROM_FLEXOR_RESISTANCE_LEVEL = 0.90f;
 
 // Every assistance level uses the same trajectory duration. Levels change
-// only the CH1 participation requirement below; they never make the motor
-// faster or more aggressive.
+// the CH1 start/participation requirements, never motor speed or torque.
 // Training uses a separate front-loaded but zero-velocity-start trajectory:
 // take up slack early, then leave several seconds near the target for EMG
 // participation and cocontraction observation. ROM and returns stay quintic.
@@ -228,9 +237,10 @@ constexpr uint8_t TRAIN_MAX_TRANSIENT_RESUMES = 3;
 constexpr uint32_t TRAIN_RESUME_MIN_DURATION_MS = 3000;
 // With one shared INA219, add the selected fingers' ROM current-rise budgets
 // only once over the common baseline, then discount the sum for simultaneous
-// operation. Never let adding a finger lower the group limit below the
-// highest selected single-finger trip. This is a bench-test starting value.
-constexpr float TRAIN_GROUP_CURRENT_RISE_SUM_FACTOR = 0.60f;
+// operation. This is a CH1+CH2 cocontraction corroboration reference during
+// training, not a training soft-current cutoff or validated force limit.
+// Never let adding a finger lower it below the highest single-finger trip.
+constexpr float TRAIN_GROUP_CURRENT_RISE_SUM_FACTOR = 0.90f;
 constexpr float TRAIN_HARD_CURRENT_MARGIN_MA = 100.0f;
 constexpr uint8_t TRAIN_GROUP_MAX_COMMAND_STEP_DEG = 2;
 constexpr uint32_t TRAIN_ATTACH_SETTLE_MS = 300;
@@ -267,6 +277,10 @@ static_assert(SERVO_COMMAND_INTERVAL_MS > 0 &&
 static_assert(TRAIN_RELEASE_HOLD_MS > 0 && TRAIN_REARM_HOLD_MS > 0 &&
                   TRAIN_TRIGGER_ACTIVATION > 0.0f &&
                   TRAIN_TRIGGER_ACTIVATION < 1.0f &&
+                  TRAIN_TRIGGER_LEVEL_10_ACTIVATION >
+                      TRAIN_REARM_HYSTERESIS &&
+                  TRAIN_TRIGGER_LEVEL_10_ACTIVATION <=
+                      TRAIN_TRIGGER_ACTIVATION &&
                   TRAIN_TRIGGER_ABOVE_REST_ACTIVATION > 0.0f &&
                   TRAIN_TRIGGER_ABOVE_REST_ACTIVATION < 1.0f &&
                   TRAIN_REARM_HYSTERESIS > 0.0f &&
@@ -338,6 +352,9 @@ static_assert(EMG_EXTENSOR_MIN_CALIBRATION_SPAN >=
                   EMG_FLEXOR_MIN_CALIBRATION_SPAN > 0.0f &&
                   EMG_MIN_CALIBRATION_SPAN_RATIO > 0.0f,
               "Channel-specific EMG calibration spans are invalid");
+static_assert(ASSISTANCE_TARGET_ACTIVATION > 0.0f &&
+                  ASSISTANCE_TARGET_ACTIVATION <= 1.0f,
+              "Assistance calibration target must be within 0..1");
 static_assert(COCONTRACTION_EXTENSOR_LEVEL > 0.0f &&
                   COCONTRACTION_EXTENSOR_LEVEL <= 1.0f &&
                   COCONTRACTION_FLEXOR_LEVEL > 0.0f &&
@@ -346,7 +363,11 @@ static_assert(COCONTRACTION_EXTENSOR_LEVEL > 0.0f &&
                   TRAIN_TRIGGER_FLEXOR_VETO_LEVEL <= 1.0f &&
                   ROM_FLEXOR_RESISTANCE_LEVEL > 0.0f &&
                   ROM_FLEXOR_RESISTANCE_LEVEL <= 1.0f &&
-                  COCONTRACTION_HOLD_MS > 0,
+                  COCONTRACTION_HOLD_MS > COCONTRACTION_CURRENT_HOLD_MS &&
+                  ROM_COCONTRACTION_HOLD_MS >= COCONTRACTION_HOLD_MS &&
+                  COCONTRACTION_CURRENT_HOLD_MS > 0 &&
+                  COCONTRACTION_CURRENT_SUPPORT_FRACTION > 0.0f &&
+                  COCONTRACTION_CURRENT_SUPPORT_FRACTION < 1.0f,
               "Cocontraction confirmation settings are invalid");
 static_assert(EMG_CALIBRATION_FEATURE_COUNT > 0,
               "EMG calibration feature count is invalid");

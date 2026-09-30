@@ -22,14 +22,14 @@ RehabSystem::RehabSystem()
       calibrationCollecting(false),
       calibrationExtensorSamples{},
       calibrationFlexorSamples{},
+      calibratedExtensorSustainedActivation(0.0f),
       sampleCount(0),
       emgFaultPending(false),
       emgFaultStartTime(0),
       romPhase(RomPhase::PREPARING),
       calibFingerIndex(0),
       lastStepTime(0),
-      romActivationSum(0.0f),
-      romActivationSamples(0),
+      romGoodEmgSamples(0),
       romRetryCurrentFinger(false),
       romCurrentBaselineSamples{},
       romCurrentBaselineSampleCount(0),
@@ -107,7 +107,7 @@ void RehabSystem::begin() {
         "ROM_CURRENT_HEADER,finger,angle,baseline_ma,raw_ma,filtered_ma,"
         "step_peak_ma,trip_ma");
     Serial.println(
-        "TRAIN_CURRENT_HEADER,event,mask,raw_ma,filtered_ma,group_limit_ma");
+        "TRAIN_CURRENT_HEADER,event,mask,raw_ma,filtered_ma,hard_limit_ma");
   }
   bootId = esp_random();
   if (bootId == 0) {
@@ -272,7 +272,7 @@ void RehabSystem::update() {
       // Servo PWM/attachment can delay an isolated raw sample. The common
       // fault confirmer above rejects that transient but still fails safe if
       // acquisition or signal quality remains bad for EMG_FAULT_CONFIRM_MS.
-      processTraining(nowMs, newEmgSample, emgDataFault, newCurrentSample);
+      processTraining(nowMs, newEmgSample, emgDataFault);
       break;
 
     case SystemState::SAFETY_RETURNING:
@@ -656,13 +656,22 @@ void RehabSystem::processEmgCalibration(uint32_t nowMs,
   if (currentState == SystemState::CALIB_EXTENSOR_MAX) {
     emgSensor.setExtensorMax(
         calculateRobustMvc(calibrationExtensorSamples, sampleCount));
-    if (emgSensor.getExtensorMVC() - emgSensor.getExtensorThreshold() <
+    const float extensorSpan =
+        emgSensor.getExtensorMVC() - emgSensor.getExtensorThreshold();
+    if (extensorSpan <
         fmaxf(EMG_EXTENSOR_MIN_CALIBRATION_SPAN,
               emgSensor.getExtensorThreshold() *
                   EMG_MIN_CALIBRATION_SPAN_RATIO)) {
       retryEmgCalibrationStage("extensor_mvc_invalid", nowMs);
       return;
     }
+    // calculateRobustMvc() sorted these samples. Their median represents
+    // sustained voluntary effort during the instructed CH1 contraction,
+    // unlike passive ROM, and is normalized to this session's own MVC.
+    calibratedExtensorSustainedActivation = clampUnit(
+        (medianOfSorted(calibrationExtensorSamples, sampleCount) -
+         emgSensor.getExtensorThreshold()) /
+        extensorSpan);
     startEmgCalibrationStage(SystemState::CALIB_FLEXOR_MAX, nowMs);
     return;
   }
@@ -702,8 +711,7 @@ void RehabSystem::startFingerCalibration(uint8_t finger, uint32_t nowMs) {
   romPhase = RomPhase::PREPARING;
   phaseStartTime = nowMs;
   lastStepTime = nowMs;
-  romActivationSum = 0.0f;
-  romActivationSamples = 0;
+  romGoodEmgSamples = 0;
   romRetryCurrentFinger = false;
   romCurrentBaselineSampleCount = 0;
   romLoadRiseHighSamples = 0;
@@ -783,8 +791,7 @@ void RehabSystem::processFingerCalibration(uint32_t nowMs,
 
     romPhase = RomPhase::MOVING;
     lastStepTime = nowMs;
-    romActivationSum = 0.0f;
-    romActivationSamples = 0;
+    romGoodEmgSamples = 0;
     romLoadRiseHighSamples = 0;
     romStepPeakCurrentMa = currentSensor.getCurrentmA();
     resetStallEvidence();
@@ -849,8 +856,9 @@ void RehabSystem::processFingerCalibration(uint32_t nowMs,
 
     if (newEmgSample && emgSensor.isWindowReady() &&
         emgSensor.isSignalQualityGood()) {
-      romActivationSum += emgSensor.getExtensorActivation();
-      ++romActivationSamples;
+      // ROM is passive: count valid EMG windows for endpoint confidence,
+      // never interpret low CH1 activity here as muscular weakness.
+      ++romGoodEmgSamples;
     }
 
     if (isCocontractionConfirmed(nowMs, newEmgSample)) {
@@ -952,7 +960,6 @@ void RehabSystem::retryFingerCalibration(const char* reason,
 
   FingerProfile& profile = fingerProfiles[calibFingerIndex];
   profile.targetAngle = homeAngle;
-  profile.meanExtensorActivation = 0.0f;
   profile.homeCurrentBaselineMa = 0.0f;
   profile.currentNoiseMa = 0.0f;
   profile.currentTripThresholdMa = STALL_CURRENT_THRES_MA;
@@ -990,7 +997,7 @@ void RehabSystem::finishFingerExtension(bool physicalLimitDetected,
           observedAngle - static_cast<int>(ROM_SAFETY_MARGIN_DEG));
   FingerProfile& profile = fingerProfiles[calibFingerIndex];
 
-  const bool enoughSamples = romActivationSamples >= 25U;
+  const bool enoughSamples = romGoodEmgSamples >= 25U;
   const bool validTarget =
       targetAngle - homeAngle >= ROM_MIN_TARGET_ANGLE;
   const bool reachedSoftwareEnd =
@@ -1002,8 +1009,6 @@ void RehabSystem::finishFingerExtension(bool physicalLimitDetected,
   if (acceptedEndpoint && enoughSamples && validTarget &&
       servo.setMaxAngleForFinger(calibFingerIndex, targetAngle)) {
     profile.targetAngle = targetAngle;
-    profile.meanExtensorActivation =
-        romActivationSum / static_cast<float>(romActivationSamples);
     profile.calibrated = true;
     profile.physicalLimitDetected = physicalLimitDetected;
     calibratedFingerMask |= static_cast<uint8_t>(1U << calibFingerIndex);
@@ -1106,49 +1111,25 @@ void RehabSystem::finalizeAssistanceProfiles() {
     return;
   }
 
-  float bestActivation = 0.0f;
-  float lowestActivation = 1.0f;
-  for (uint8_t i = 0; i < FINGER_COUNT; ++i) {
-    if (fingerProfiles[i].calibrated) {
-      const float activation =
-          clampUnit(fingerProfiles[i].meanExtensorActivation);
-      if (activation > bestActivation) {
-        bestActivation = activation;
-      }
-      if (activation < lowestActivation) {
-        lowestActivation = activation;
-      }
-    }
-  }
-
-  const float activationSpread = bestActivation - lowestActivation;
-  const float relativeBlend =
-      ASSISTANCE_RELATIVE_SPREAD_FULL > 0.0f
-          ? 0.30f * clampUnit(activationSpread /
-                              ASSISTANCE_RELATIVE_SPREAD_FULL)
-          : 0.0f;
+  // CH1 is one shared extensor channel; passive ROM cannot determine
+  // independent finger strength. Begin every available finger at the same
+  // level derived from the active CH1 calibration, then adapt by failures.
+  const float sustainedActivation =
+      clampUnit(calibratedExtensorSustainedActivation);
+  const float weakness = clampUnit(
+      (ASSISTANCE_TARGET_ACTIVATION - sustainedActivation) /
+      ASSISTANCE_TARGET_ACTIVATION);
+  const uint8_t initialLevel = static_cast<uint8_t>(
+      1U + static_cast<uint8_t>(lroundf(9.0f * smoothStep(weakness))));
+  Serial.printf("ASSIST_INIT,sustained_ch1_pct=%.1f,level=%u\n",
+                100.0f * sustainedActivation, initialLevel);
 
   for (uint8_t i = 0; i < FINGER_COUNT; ++i) {
     FingerProfile& profile = fingerProfiles[i];
     if (!profile.calibrated) {
       continue;
     }
-
-    const float activation = clampUnit(profile.meanExtensorActivation);
-    const float absoluteWeakness = clampUnit(
-        (ASSISTANCE_TARGET_ACTIVATION - activation) /
-        ASSISTANCE_TARGET_ACTIVATION);
-    const float relativeWeakness =
-        bestActivation > 0.0f
-            ? clampUnit((bestActivation - activation) / bestActivation)
-            : 0.0f;
-    const float weakness =
-        clampUnit(((1.0f - relativeBlend) * absoluteWeakness) +
-                  (relativeBlend * relativeWeakness));
-    const float weightedWeakness = smoothStep(weakness);
-
-    profile.assistLevel = static_cast<uint8_t>(
-        1U + static_cast<uint8_t>(lroundf(9.0f * weightedWeakness)));
+    profile.assistLevel = initialLevel;
     profile.failuresAtLevel = 0;
   }
 
@@ -1241,23 +1222,12 @@ void RehabSystem::startTrainingSession(uint32_t nowMs) {
 
 void RehabSystem::processTraining(uint32_t nowMs,
                                   bool newEmgSample,
-                                  bool emgDataFault,
-                                  bool newCurrentSample) {
+                                  bool emgDataFault) {
   const bool emgEvidenceGap = refreshEmgEvidence(nowMs, newEmgSample);
   const bool motorNeedsEmgProtection =
       trainingPhase == TrainingPhase::MOVING ||
-      trainingPhase == TrainingPhase::STALL_CONFIRMING ||
       trainingPhase == TrainingPhase::HOLDING;
   if (emgDataFault && motorNeedsEmgProtection) {
-    const float groupLimit = calculateGroupSoftCurrentLimit(trainingMask);
-    if ((trainingPhase == TrainingPhase::MOVING ||
-         trainingPhase == TrainingPhase::STALL_CONFIRMING ||
-         trainingPhase == TrainingPhase::HOLDING) &&
-        currentSensor.getCurrentmA() >= groupLimit &&
-        !relieveTrainingGroup()) {
-      enterFault("STALL_RELEASE");
-      return;
-    }
     triggerSafetyReturn("EMG_BAD", SystemState::TRAINING_READY, false,
                         nowMs);
     return;
@@ -1267,26 +1237,13 @@ void RehabSystem::processTraining(uint32_t nowMs,
       trainingPhase != TrainingPhase::RETURNING) {
     // PREPARING, WAITING_RELEASE and WAITING_TRIGGER are stationary. The RMS
     // window is deliberately reset when a session starts, so a brief gap here
-    // is expected. Keep current protection active and wait for a fresh window
-    // instead of ending a zero-attempt session as EMG_BAD.
+    // is expected. Hard-current protection remains active in update().
     resetActivationEvidence();
     return;
   }
 
   if (trainingPhase == TrainingPhase::WAITING_RELEASE) {
     trainingTriggered = false;
-    const StallStatus waitingLoad = updateStallStatus(
-        nowMs, STALL_CONFIRM_TIME_MS,
-        calculateGroupSoftCurrentLimit(trainingMask));
-    if (waitingLoad == StallStatus::CONFIRMED) {
-      recordTrainingCurrentSafety("waiting_release");
-      beginTrainingReturn(nowMs, false,
-                          TrainingReturnCause::CURRENT_SAFETY);
-      return;
-    }
-    if (waitingLoad == StallStatus::PENDING) {
-      return;
-    }
     if (!newEmgSample || !emgSensor.isWindowReady()) {
       return;
     }
@@ -1319,10 +1276,8 @@ void RehabSystem::processTraining(uint32_t nowMs,
           0.0f, 1.0f);
       trainingRestBaselineValid = true;
     } else {
-      const float triggerActivation = fmaxf(
-          TRAIN_TRIGGER_ACTIVATION,
-          trainingRestExtensorActivation +
-              TRAIN_TRIGGER_ABOVE_REST_ACTIVATION);
+      const float triggerActivation =
+          calculateTrainingTriggerActivation(trainingMask);
       const float rearmActivation =
           fmaxf(0.0f, triggerActivation - TRAIN_REARM_HYSTERESIS);
       if (extensorActivation > rearmActivation) {
@@ -1349,18 +1304,6 @@ void RehabSystem::processTraining(uint32_t nowMs,
   }
 
   if (trainingPhase == TrainingPhase::WAITING_TRIGGER) {
-    const StallStatus waitingLoad = updateStallStatus(
-        nowMs, STALL_CONFIRM_TIME_MS,
-        calculateGroupSoftCurrentLimit(trainingMask));
-    if (waitingLoad == StallStatus::CONFIRMED) {
-      recordTrainingCurrentSafety("waiting_trigger");
-      beginTrainingReturn(nowMs, false,
-                          TrainingReturnCause::CURRENT_SAFETY);
-      return;
-    }
-    if (waitingLoad == StallStatus::PENDING) {
-      return;
-    }
     if (!newEmgSample || !emgSensor.isWindowReady()) {
       return;
     }
@@ -1369,10 +1312,8 @@ void RehabSystem::processTraining(uint32_t nowMs,
       return;
     }
 
-    const float triggerActivation = fmaxf(
-        TRAIN_TRIGGER_ACTIVATION,
-        trainingRestExtensorActivation +
-            TRAIN_TRIGGER_ABOVE_REST_ACTIVATION);
+    const float triggerActivation =
+        calculateTrainingTriggerActivation(trainingMask);
     const bool triggerCondition =
         emgSensor.getExtensorActivation() >= triggerActivation &&
         emgSensor.getFlexorActivation() <
@@ -1393,7 +1334,7 @@ void RehabSystem::processTraining(uint32_t nowMs,
 
     triggerPending = false;
     trainingTriggerActivationReference =
-        fmaxf(emgSensor.getExtensorActivation(), TRAIN_TRIGGER_ACTIVATION);
+        fmaxf(emgSensor.getExtensorActivation(), triggerActivation);
     trainingParticipationRequired = calculateParticipationRequirement(
         trainingMask, trainingTriggerActivationReference);
     resetParticipationEvidence();
@@ -1451,22 +1392,6 @@ void RehabSystem::processTraining(uint32_t nowMs,
       return;
     }
 
-    const float groupLimit =
-        calculateGroupSoftCurrentLimit(trainingAttachMask);
-    const StallStatus attachLoad =
-        updateStallStatus(nowMs, STALL_CONFIRM_TIME_MS, groupLimit);
-    if (attachLoad == StallStatus::CONFIRMED) {
-      recordTrainingCurrentSafety("arming");
-      beginTrainingReturn(nowMs, false,
-                          TrainingReturnCause::CURRENT_SAFETY);
-      return;
-    }
-    if (attachLoad == StallStatus::PENDING) {
-      homeSettlePending = false;
-      homeSettleStartTime = 0;
-      return;
-    }
-
     if (!homeSettlePending) {
       homeSettlePending = true;
       homeSettleStartTime = nowMs;
@@ -1487,90 +1412,12 @@ void RehabSystem::processTraining(uint32_t nowMs,
     return;
   }
 
-  if (trainingPhase == TrainingPhase::STALL_CONFIRMING) {
-    // Do not bypass the time-qualified CH1+CH2 rule just because current is
-    // also being confirmed. A single CH2 peak is not cocontraction.
-    if (isCocontractionConfirmed(nowMs, newEmgSample)) {
-      if (sessionCocontractionCnt < UINT16_MAX) {
-        ++sessionCocontractionCnt;
-      }
-      triggerSafetyReturn("RESIST", SystemState::TRAINING_READY, false,
-                          nowMs);
-      return;
-    }
-
-    if (static_cast<uint32_t>(nowMs - phaseStartTime) >=
-        TRAIN_STALL_CONFIRM_TIMEOUT_MS) {
-      recordTrainingCurrentSafety("moving_timeout");
-      beginTrainingReturn(nowMs, true,
-                          TrainingReturnCause::CURRENT_SAFETY);
-      return;
-    }
-    if (!newCurrentSample) {
-      return;
-    }
-
-    const bool currentStillHigh =
-        currentSensor.getCurrentmA() >=
-        calculateGroupSoftCurrentLimit(trainingMask);
-
-    if (!currentStillHigh) {
-      if (stallConfirmationClearSamples < UINT8_MAX) {
-        ++stallConfirmationClearSamples;
-      }
-      if (stallConfirmationClearSamples < TRAIN_STALL_CLEAR_SAMPLES) {
-        return;
-      }
-
-      if (trainingResumeCount >= TRAIN_MAX_TRANSIENT_RESUMES) {
-        recordTrainingCurrentSafety("moving_unstable");
-        beginTrainingReturn(nowMs, true,
-                            TrainingReturnCause::CURRENT_SAFETY);
-        return;
-      }
-      ++trainingResumeCount;
-      if (!startTrainingTrajectory(nowMs, true)) {
-        enterFault("MOVE_RESUME");
-      }
-      return;
-    }
-
-    stallConfirmationClearSamples = 0;
-    if (stallConfirmationHighSamples < UINT8_MAX) {
-      ++stallConfirmationHighSamples;
-    }
-    if (stallConfirmationHighSamples < TRAIN_STALL_PERSIST_SAMPLES) {
-      return;
-    }
-    recordTrainingCurrentSafety("moving");
-    beginTrainingReturn(nowMs, true,
-                        TrainingReturnCause::CURRENT_SAFETY);
-    return;
-  }
-
   if (trainingPhase == TrainingPhase::MOVING) {
     if (isCocontractionConfirmed(nowMs, newEmgSample)) {
       if (sessionCocontractionCnt < UINT16_MAX) {
         ++sessionCocontractionCnt;
       }
       triggerSafetyReturn("COCON", SystemState::TRAINING_READY, false, nowMs);
-      return;
-    }
-
-    const float groupLimit =
-        calculateGroupSoftCurrentLimit(trainingMask);
-    const StallStatus aggregateStall =
-        updateStallStatus(nowMs, STALL_CONFIRM_TIME_MS, groupLimit);
-
-    if (aggregateStall == StallStatus::CONFIRMED) {
-      // Do not stop and restart the trajectory for a single PWM/current
-      // spike. That behavior produced visible servo twitching, especially on
-      // the short-travel index finger. The soft limit must remain high for
-      // STALL_CONFIRM_TIME_MS before all fingers return together. The global
-      // hard-current limit is still handled immediately in update().
-      recordTrainingCurrentSafety("moving");
-      beginTrainingReturn(nowMs, true,
-                          TrainingReturnCause::CURRENT_SAFETY);
       return;
     }
 
@@ -1612,18 +1459,7 @@ void RehabSystem::processTraining(uint32_t nowMs,
       return;
     }
 
-    const StallStatus holdStall =
-        updateStallStatus(nowMs, STALL_CONFIRM_TIME_MS,
-                          calculateGroupSoftCurrentLimit(trainingMask));
-    if (holdStall == StallStatus::CONFIRMED) {
-      recordTrainingCurrentSafety("holding");
-      beginTrainingReturn(nowMs, true,
-                          TrainingReturnCause::CURRENT_SAFETY);
-      return;
-    }
-
-    if (holdStall == StallStatus::PENDING ||
-        cocontractionPending || !newEmgSample) {
+    if (cocontractionPending || !newEmgSample) {
       return;
     }
 
@@ -1641,16 +1477,7 @@ void RehabSystem::processTraining(uint32_t nowMs,
     enterFault("RET_TIMEOUT");
     return;
   }
-  const StallStatus returnStall =
-      updateStallStatus(nowMs, RETURN_STALL_CONFIRM_TIME_MS,
-                        calculateGroupSoftCurrentLimit(trainingMask));
-  if (returnStall == StallStatus::CONFIRMED) {
-    recordTrainingCurrentSafety("returning");
-    enterFault("RETURN_STALL");
-    return;
-  }
-
-  if (!isReturnSettled(nowMs, returnStall)) {
+  if (!isReturnSettled(nowMs, StallStatus::CLEAR)) {
     return;
   }
   if (!servo.allAtHome(trainingMask)) {
@@ -1804,28 +1631,6 @@ bool RehabSystem::startTrainingTrajectory(uint32_t nowMs, bool resumed) {
            trainingMask, resumed ? "true" : "false");
   ble.sendData(message);
   return true;
-}
-
-void RehabSystem::beginTrainingStallConfirmation(uint32_t nowMs) {
-  servo.stopMotion();
-  trainingPhase = TrainingPhase::STALL_CONFIRMING;
-  phaseStartTime = nowMs;
-  // The sample that caused this state transition is the first high-evidence
-  // sample. Further high samples may be interleaved with brief PWM lows.
-  stallConfirmationHighSamples = 1;
-  stallConfirmationClearSamples = 0;
-  stallPending = false;
-  stallStartTime = 0;
-  homeSettlePending = false;
-  homeSettleStartTime = 0;
-
-  char message[128];
-  snprintf(message, sizeof(message),
-           "{\"event\":\"current_safety\",\"state\":\"checking\","
-           "\"sid\":%lu,\"mask\":%u,\"limit_ma\":%.1f}",
-           static_cast<unsigned long>(trainingSessionId), trainingMask,
-           calculateGroupSoftCurrentLimit(trainingMask));
-  ble.sendData(message);
 }
 
 void RehabSystem::beginTrainingReturn(uint32_t nowMs,
@@ -2041,6 +1846,21 @@ void RehabSystem::resetParticipationEvidence() {
   participationRecoveryStartTime = 0;
 }
 
+float RehabSystem::calculateTrainingTriggerActivation(uint8_t mask) const {
+  const uint8_t level = constrain(getMaximumAssistLevel(mask), 1, 10);
+  const float levelPosition = static_cast<float>(level - 1U) / 9.0f;
+  const float absoluteThreshold =
+      TRAIN_TRIGGER_ACTIVATION +
+      (TRAIN_TRIGGER_LEVEL_10_ACTIVATION - TRAIN_TRIGGER_ACTIVATION) *
+          levelPosition;
+  const float aboveRestThreshold =
+      TRAIN_TRIGGER_ABOVE_REST_ACTIVATION +
+      (TRAIN_TRIGGER_LEVEL_10_ACTIVATION -
+       TRAIN_TRIGGER_ABOVE_REST_ACTIVATION) * levelPosition;
+  return fmaxf(absoluteThreshold,
+               trainingRestExtensorActivation + aboveRestThreshold);
+}
+
 float RehabSystem::calculateParticipationRequirement(
     uint8_t mask, float triggerReference) const {
   uint8_t level = getMaximumAssistLevel(mask);
@@ -2066,13 +1886,12 @@ void RehabSystem::recordTrainingCurrentSafety(const char* phase) {
     ++sessionCurrentSafetyCount;
   }
 
-  const float measured = constrain(currentSensor.getCurrentmA(),
+  const float measured = constrain(currentSensor.getRawCurrentmA(),
                                    0.0f, 99999.9f);
-  const float limit = constrain(calculateGroupSoftCurrentLimit(trainingMask),
-                                0.0f, 99999.9f);
+  const float limit = HARD_CURRENT_THRES_MA;
   if (CURRENT_DIAGNOSTICS_ENABLED) {
     Serial.printf("TRAIN_CURRENT,TRIGGERED,%u,%.1f,%.1f,%.1f\n",
-                  trainingMask, currentSensor.getRawCurrentmA(), measured,
+                  trainingMask, measured, currentSensor.getCurrentmA(),
                   limit);
   }
   char message[208];
@@ -2080,7 +1899,7 @@ void RehabSystem::recordTrainingCurrentSafety(const char* phase) {
            "{\"event\":\"current_safety\",\"state\":\"triggered\","
            "\"sid\":%lu,\"mask\":%u,\"finger\":null,"
            "\"current_ma\":%.1f,\"limit_ma\":%.1f,"
-           "\"scope\":\"group\",\"phase\":\"%s\"}",
+           "\"scope\":\"hard\",\"phase\":\"%s\"}",
            static_cast<unsigned long>(trainingSessionId), trainingMask,
            measured, limit, phase != nullptr ? phase : "unknown");
   ble.sendData(message);
@@ -2503,8 +2322,24 @@ bool RehabSystem::isCocontractionConfirmed(uint32_t nowMs,
     return false;
   }
 
-  return static_cast<uint32_t>(nowMs - cocontractionStartTime) >=
-         COCONTRACTION_HOLD_MS;
+  const uint32_t simultaneousMs = nowMs - cocontractionStartTime;
+  if (currentState == SystemState::CALIB_PASSIVE_RANGE) {
+    return simultaneousMs >= ROM_COCONTRACTION_HOLD_MS;
+  }
+
+  // Current only corroborates simultaneous EMG; it never replaces either
+  // channel or overrides the independent hard-current protection.
+  if (currentState == SystemState::TRAINING_ACTIVE &&
+      (trainingPhase == TrainingPhase::MOVING ||
+       trainingPhase == TrainingPhase::HOLDING) &&
+      simultaneousMs >= COCONTRACTION_CURRENT_HOLD_MS &&
+      currentSensor.isReady() &&
+      currentSensor.getCurrentmA() >=
+          COCONTRACTION_CURRENT_SUPPORT_FRACTION *
+              calculateGroupSoftCurrentLimit(trainingMask)) {
+    return true;
+  }
+  return simultaneousMs >= COCONTRACTION_HOLD_MS;
 }
 
 void RehabSystem::resetActivationEvidence() {
@@ -2541,9 +2376,9 @@ bool RehabSystem::refreshEmgEvidence(uint32_t nowMs, bool newEmgSample) {
 
 void RehabSystem::resetFingerProfiles() {
   calibratedFingerMask = 0;
+  calibratedExtensorSustainedActivation = 0.0f;
   for (uint8_t i = 0; i < FINGER_COUNT; ++i) {
     fingerProfiles[i].targetAngle = servo.getHomeAngleForFinger(i);
-    fingerProfiles[i].meanExtensorActivation = 0.0f;
     fingerProfiles[i].homeCurrentBaselineMa = 0.0f;
     fingerProfiles[i].currentNoiseMa = 0.0f;
     fingerProfiles[i].currentTripThresholdMa = STALL_CURRENT_THRES_MA;
@@ -2639,9 +2474,8 @@ void RehabSystem::sendRealtimeTelemetry(uint32_t nowMs) {
           flexorLevel &&
       static_cast<uint32_t>(nowMs - cocontractionStartTime) >=
           COCONTRACTION_HOLD_MS;
-  bool stallDetected =
-      currentState == SystemState::TRAINING_ACTIVE &&
-      trainingPhase == TrainingPhase::STALL_CONFIRMING;
+  bool stallDetected = currentSensor.isReady() &&
+                       currentSensor.isHardOverCurrent();
   if (currentSensor.isReady() && enabledMask != 0) {
     if (currentState == SystemState::CALIB_PASSIVE_RANGE &&
         romPhase == RomPhase::MOVING &&
@@ -2650,10 +2484,6 @@ void RehabSystem::sendRealtimeTelemetry(uint32_t nowMs) {
       stallDetected =
           currentSensor.getCurrentmA() >=
           fingerProfiles[calibFingerIndex].currentTripThresholdMa;
-    } else if (currentState == SystemState::TRAINING_ACTIVE) {
-      stallDetected = stallDetected ||
-          currentSensor.getCurrentmA() >=
-              calculateGroupSoftCurrentLimit(enabledMask);
     }
   }
 

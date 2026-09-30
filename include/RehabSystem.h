@@ -16,7 +16,6 @@ public:
 private:
   struct FingerProfile {
     int targetAngle;
-    float meanExtensorActivation;
     float homeCurrentBaselineMa;
     float currentNoiseMa;
     float currentTripThresholdMa;
@@ -38,7 +37,6 @@ private:
     WAITING_TRIGGER,
     PREPARING,
     MOVING,
-    STALL_CONFIRMING,
     HOLDING,
     RETURNING
   };
@@ -75,6 +73,7 @@ private:
   bool calibrationCollecting;
   float calibrationExtensorSamples[EMG_CALIBRATION_FEATURE_COUNT];
   float calibrationFlexorSamples[EMG_CALIBRATION_FEATURE_COUNT];
+  float calibratedExtensorSustainedActivation;
   uint16_t sampleCount;
   bool emgFaultPending;
   uint32_t emgFaultStartTime;
@@ -83,8 +82,7 @@ private:
   RomPhase romPhase;
   uint8_t calibFingerIndex;
   uint32_t lastStepTime;
-  float romActivationSum;
-  uint32_t romActivationSamples;
+  uint32_t romGoodEmgSamples;
   bool romRetryCurrentFinger;
   float romCurrentBaselineSamples[ROM_CURRENT_BASELINE_MAX_SAMPLES];
   uint16_t romCurrentBaselineSampleCount;
@@ -177,16 +175,16 @@ private:
 
   void startTrainingSession(uint32_t nowMs);
   void processTraining(uint32_t nowMs, bool newEmgSample,
-                       bool emgDataFault, bool newCurrentSample);
+                       bool emgDataFault);
   bool startTrainingGroup(uint32_t nowMs);
   bool startTrainingTrajectory(uint32_t nowMs, bool resumed);
-  void beginTrainingStallConfirmation(uint32_t nowMs);
   void beginTrainingReturn(
       uint32_t nowMs, bool applyImmediateRelief,
       TrainingReturnCause cause = TrainingReturnCause::ATTEMPT);
   void recordTrainingAttempt(uint8_t fingerMask, bool success);
   bool processTrainingParticipation(uint32_t nowMs, bool newEmgSample);
   void resetParticipationEvidence();
+  float calculateTrainingTriggerActivation(uint8_t mask) const;
   float calculateParticipationRequirement(uint8_t mask,
                                           float triggerReference) const;
   void recordTrainingCurrentSafety(const char* phase);
