@@ -41,14 +41,18 @@ BleManager::BleManager() {
   negotiatedMtu = 23;
   commandQueue = nullptr;
   safetyQueue = nullptr;
+  txQueue = nullptr;
+  lastTxTime = 0;
 }
 
 void BleManager::begin() {
   negotiatedMtu = 23;
   commandQueue = xQueueCreate(BLE_COMMAND_QUEUE_LENGTH, sizeof(CommandMessage));
   safetyQueue = xQueueCreate(1, sizeof(BleSafetyCommand));
+  txQueue = xQueueCreate(BLE_TX_QUEUE_LENGTH, sizeof(TxMessage));
 
-  if (commandQueue == nullptr || safetyQueue == nullptr) {
+  if (commandQueue == nullptr || safetyQueue == nullptr ||
+      txQueue == nullptr) {
     Serial.println("[BLE] Failed to create command queues; BLE will not start.");
     if (commandQueue != nullptr) {
       vQueueDelete(commandQueue);
@@ -57,6 +61,10 @@ void BleManager::begin() {
     if (safetyQueue != nullptr) {
       vQueueDelete(safetyQueue);
       safetyQueue = nullptr;
+    }
+    if (txQueue != nullptr) {
+      vQueueDelete(txQueue);
+      txQueue = nullptr;
     }
     return;
   }
@@ -73,8 +81,10 @@ void BleManager::begin() {
     Serial.println("[BLE] Failed to create security context; BLE will not start.");
     vQueueDelete(commandQueue);
     vQueueDelete(safetyQueue);
+    vQueueDelete(txQueue);
     commandQueue = nullptr;
     safetyQueue = nullptr;
+    txQueue = nullptr;
     return;
   }
   pSecurity->setStaticPIN(BLE_STATIC_PASSKEY);
@@ -124,6 +134,7 @@ void BleManager::begin() {
 void BleManager::onConnect(BLEServer* pServer) {
   deviceConnected = true;
   negotiatedMtu = 23;
+  lastTxTime = 0;
   Serial.println("[BLE] 중앙 장치(앱) 연결됨");
 }
 
@@ -137,6 +148,9 @@ void BleManager::onDisconnect(BLEServer* pServer) {
   // that is already latched.
   if (commandQueue != nullptr) {
     xQueueReset(commandQueue);
+  }
+  if (txQueue != nullptr) {
+    xQueueReset(txQueue);
   }
   if (safetyQueue != nullptr) {
     const BleSafetyCommand disconnect = BleSafetyCommand::DISCONNECT;
@@ -234,24 +248,68 @@ void BleManager::onWrite(BLECharacteristic* pCharacteristic) {
   Serial.printf("[BLE 수신]: %s\n", message.data);
 }
 
-void BleManager::sendData(String message) {
-  if (deviceConnected && pTxCharacteristic != nullptr) {
-    const uint16_t mtu = negotiatedMtu;
-    const size_t maximumPayload = mtu > 3U ? mtu - 3U : 0U;
-    if (message.length() > maximumPayload) {
-      static const char mtuError[] = "{\"error\":\"MTU\"}";
-      if (maximumPayload >= sizeof(mtuError) - 1U) {
-        pTxCharacteristic->setValue(mtuError);
-        pTxCharacteristic->notify();
-      }
-      Serial.printf("[BLE] TX frame exceeds negotiated MTU (%u): %s\n",
-                    static_cast<unsigned>(mtu), message.c_str());
-      return;
-    }
-    pTxCharacteristic->setValue(message.c_str());
-    pTxCharacteristic->notify();
-    Serial.printf("[BLE 송신]: %s\n", message.c_str());
+bool BleManager::sendData(const String& message, bool important) {
+  if (!deviceConnected || pTxCharacteristic == nullptr || txQueue == nullptr) {
+    return false;
   }
+
+  const uint16_t mtu = negotiatedMtu;
+  const size_t maximumPayload = mtu > 3U ? mtu - 3U : 0U;
+  if (message.length() > maximumPayload ||
+      message.length() >= sizeof(TxMessage::data)) {
+    Serial.printf("[BLE] TX frame exceeds negotiated MTU (%u): %s\n",
+                  static_cast<unsigned>(mtu), message.c_str());
+    return false;
+  }
+
+  TxMessage queued{};
+  memcpy(queued.data, message.c_str(), message.length());
+  queued.data[message.length()] = '\0';
+  if (xQueueSend(txQueue, &queued, 0) != pdPASS) {
+    if (!important) {
+      return false;
+    }
+
+    // A stale realtime frame must not make a state transition, warning, or
+    // session record disappear. Make room for the important frame. The final
+    // session summary is additionally retried until SES_ACK.
+    TxMessage dropped{};
+    if (xQueueReceive(txQueue, &dropped, 0) != pdPASS ||
+        xQueueSend(txQueue, &queued, 0) != pdPASS) {
+      Serial.println("[BLE] TX queue full; important frame not queued.");
+      return false;
+    }
+    Serial.println("[BLE] TX queue full; oldest frame replaced by event.");
+  }
+  return true;
+}
+
+void BleManager::update(uint32_t nowMs) {
+  if (!deviceConnected || pTxCharacteristic == nullptr || txQueue == nullptr ||
+      (lastTxTime != 0 &&
+       static_cast<uint32_t>(nowMs - lastTxTime) < BLE_TX_PACKET_GAP_MS)) {
+    return;
+  }
+
+  TxMessage message{};
+  if (xQueueReceive(txQueue, &message, 0) != pdPASS) {
+    return;
+  }
+
+  const size_t length = strnlen(message.data, sizeof(message.data));
+  const uint16_t mtu = negotiatedMtu;
+  const size_t maximumPayload = mtu > 3U ? mtu - 3U : 0U;
+  if (length > maximumPayload) {
+    Serial.printf("[BLE] Queued TX frame exceeds negotiated MTU (%u).\n",
+                  static_cast<unsigned>(mtu));
+    return;
+  }
+
+  pTxCharacteristic->setValue(
+      reinterpret_cast<uint8_t*>(message.data), length);
+  pTxCharacteristic->notify();
+  lastTxTime = millis();
+  Serial.printf("[BLE 송신]: %s\n", message.data);
 }
 
 bool BleManager::available() {

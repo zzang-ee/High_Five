@@ -57,6 +57,20 @@ EMG threshold, MVC, ROM 목표각도 또는 레벨을 다음 부팅에 복원 �
 `control`과 `profile`의 보정값·레벨은 현재 부팅의 읽기 전용 상태이다.
 앱에서 레벨을 직접 변경하는 명령은 없다.
 
+### Temporary index-servo lockout
+
+While the index servo is faulty, firmware excludes finger bit 1 (`0x02`) from
+all servo commands and ROM calibration. `FINGERS:1F` is accepted but the
+`fingers_selected` response reports the effective mask `29` (`0x1D`: thumb,
+middle, ring, pinky). `FINGERS:02` returns `{"error":"FINGER_DISABLED"}`;
+the previous valid selection is retained. During `CALIB_START`, index ROM is
+skipped and an `{"event":"rom","state":"skipped","finger":1,
+"reason":"disabled"}` event is sent. `calibration_done.mask` is `29` and
+`target_angles.index` stays `0`. The app must accept this four-finger mask as
+complete calibration and must not require the index target or index profile.
+After repairing the servo, set `TEMP_DISABLED_FINGER_MASK` in `Config.h` to
+`0`, rebuild, and run full calibration again.
+
 ## 3. boot, sid, q
 
 - `boot`: 전원을 켤 때 새로 만들어지는 장치 부팅 식별자
@@ -155,8 +169,14 @@ GND는 공통이어야 한다. 2S LiPo 전압을 GPIO32에 직접 연결하면 �
 ```
 
 `target_angle`과 `motor_level`은 선택 손가락의 평균 목표각과 최대
-레벨이다. `participation_required`는 현재 사이클의 정규화된 CH1
-참여 기준(0~1)이다. 앱 입력값이 아니며 표시·진단용이다.
+레벨이다. `motor_level`은 보조 강도 1~10단계(1: 낮은 보조,
+10: 높은 보조)이며, 앱에서 레벨로 표시할 때 이 값을 사용한다.
+`participation_required`는 현재 사이클의 정규화된 CH1 참여 기준(0~1)으로,
+레벨과 같은 값이 아니다. 해당 사이클 시작 시 CH1 활성도를 기준으로
+`motor_level` 1에서는 70%, 10에서는 35%를 요구하고 중간 레벨은
+선형 보간한다. 최소 참여 기준은 5%이며, 두 값 모두 앱 입력값이 아닌
+표시·진단용이다. 캘리브레이션의 CH1 휴식 임계값~MVC 최소 간격은
+15 RMS count와 휴식 임계값의 25% 중 큰 값이다.
 
 회전 전송되는 `profile`에는 손가락별 `target_angle`,
 `motor_level`, `failure_stack`, `calibrated`,
@@ -165,7 +185,7 @@ GND는 공통이어야 한다. 2S LiPo 전압을 GPIO32에 직접 연결하면 �
 
 ## 5. CH1 참여 경고 · 회복 · 실패
 
-모든 레벨의 정상 이동시간은 5초로 같다. 레벨은 속도나 토크 명령을
+모든 레벨의 정상 이동시간은 12초로 같다. 레벨은 속도나 토크 명령을
 높이지 않고 CH1 참여 유지 기준만 바꾼다.
 
 - 레벨 1: 트리거 시 CH1의 70% 유지
@@ -221,27 +241,21 @@ GND는 공통이어야 한다. 2S LiPo 전압을 GPIO32에 직접 연결하면 �
 안전 감시 장치이다. 공용 센서 하나로는 어느 손가락 전류인지 신뢰성 있게
 분리할 수 없으므로 `finger`는 항상 `null`이다.
 
-선택 손가락 수에 따른 soft group 기준은 현재 다음과 같다.
+soft group 기준은 보정 때 측정한 각 손가락의 홈 전류와 ROM 전류 기준을
+사용한다. 한 손가락 선택 시 해당 손가락의 ROM 기준과 같고, 여러 손가락
+선택 시 각 상승 허용량의 합에 0.60을 곱한 뒤 선택 손가락의 홈 전류 중
+가장 큰 값을 한 번만
+더한다. 선택한 손가락 중 가장 높은 단일 기준보다 낮아지지는 않는다.
+따라서 기준은 손가락 조합과 해당 부팅의 보정 결과에 따라 달라진다.
 
-| 선택 수 | 기준 |
-|---:|---:|
-| 1 | 800 mA |
-| 2 | 950 mA |
-| 3 | 1100 mA |
-| 4 | 1250 mA |
-| 5 | 1400 mA |
+예를 들어 홈 전류가 모두 약 18.4 mA이고 상승 허용량이
+엄지~약지 100 mA, 소지 85 mA이면 5개 동시 기준은 약 309.4 mA이다.
 
 1600 mA hard 기준은 배선·전원·센서의 절대 상한이므로 손가락 수만큼
 곱하지 않는다. 위 수치는 초기 벤치값이며 사람 안전이 검증된 의료 기준이
 아니다.
 
-일시적인 PWM 피크를 확인할 때:
-
-```json
-{"event":"current_safety","state":"checking","sid":1,"mask":31,"limit_ma":1400.0}
-```
-
-지속 전류가 확인되면:
+짧은 PWM 피크는 무시하고 지속 전류가 확인되면:
 
 ```json
 {
@@ -250,8 +264,8 @@ GND는 공통이어야 한다. 2S LiPo 전압을 GPIO32에 직접 연결하면 �
   "sid": 1,
   "mask": 31,
   "finger": null,
-  "current_ma": 1435.2,
-  "limit_ma": 1400.0,
+  "current_ma": 320.2,
+  "limit_ma": 309.4,
   "scope": "group",
   "phase": "moving"
 }
@@ -284,8 +298,10 @@ GND는 공통이어야 한다. 2S LiPo 전압을 GPIO32에 직접 연결하면 �
 선택 모터는 돌입전류를 분산하기 위해 세션 시작 때 홈 위치에서 30 ms
 간격으로 부착된다. 이것은 훈련 동작 시차가 아니다. 펴기와 복귀에서는
 선택한 모든 손가락을 같은 궤적 시작시각으로 두고 10 ms 주기 한 번의
-스케줄러 실행 안에서 모두 갱신한다. 전체 이동시간은 5초이며 모두 목표
-명령각에 도달하면 3초 유지한 뒤 함께 복귀한다.
+스케줄러 실행 안에서 모두 갱신한다. 훈련 신전은 12초의 전용 궤적으로
+초반에 와이어 유격을 잡고 목표각 근처에서 점차 느려진다. 모두 목표
+명령각에 도달하면 3초 유지한 뒤 함께 복귀한다. ROM과 홈 복귀는 기존
+quintic 궤적을 사용한다.
 
 일반 사이클이 홈에 도착한 뒤에는 서보를 detach하지 않고 홈 PWM을
 유지한다. 따라서 다음 CH1 트리거를 기다리는 동안에도 케이블 구속이

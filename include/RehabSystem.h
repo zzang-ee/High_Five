@@ -76,6 +76,8 @@ private:
   float calibrationExtensorSamples[EMG_CALIBRATION_FEATURE_COUNT];
   float calibrationFlexorSamples[EMG_CALIBRATION_FEATURE_COUNT];
   uint16_t sampleCount;
+  bool emgFaultPending;
+  uint32_t emgFaultStartTime;
 
   // Per-finger ROM calibration state.
   RomPhase romPhase;
@@ -104,6 +106,10 @@ private:
   uint8_t stallConfirmationHighSamples;
   uint8_t stallConfirmationClearSamples;
   uint8_t trainingResumeCount;
+  bool trainingRestBaselineValid;
+  float trainingRestExtensorActivation;
+  float releaseExtensorActivationSum;
+  uint16_t releaseActivationSampleCount;
   float trainingTriggerActivationReference;
   float trainingParticipationRequired;
   bool participationLowPending;
@@ -146,6 +152,8 @@ private:
   bool sessionSummaryPending;
   const char* completedTrainingEndReason;
   uint32_t lastTelemetryTime;
+  uint32_t lastTelemetryPacketTime;
+  uint8_t telemetryPacketIndex;
   uint8_t telemetryFingerIndex;
   uint32_t lastControlLoopTime;
   uint8_t stableBatteryPercent;

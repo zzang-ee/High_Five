@@ -7,6 +7,7 @@ ServoManager::ServoManager()
       motionStartTimeMs(0),
       lastMotionUpdateTimeMs(0),
       motionMaxCommandStepDeg(SERVO_MAX_COMMAND_STEP_DEG),
+      motionShape(TrajectoryShape::QUINTIC),
       motionActive(false) {
   for (uint8_t i = 0; i < FINGER_COUNT; ++i) {
     currentAngles[i] = SERVO_LOGICAL_HOME_ANGLE;
@@ -32,6 +33,7 @@ bool ServoManager::begin() {
   motionActive = false;
   activeMask = 0;
   motionMaxCommandStepDeg = SERVO_MAX_COMMAND_STEP_DEG;
+  motionShape = TrajectoryShape::QUINTIC;
   return true;
 }
 
@@ -62,7 +64,8 @@ void ServoManager::update(uint32_t nowMs) {
 }
 
 bool ServoManager::setAngle(uint8_t index, int logicalAngle) {
-  if (index >= FINGER_COUNT || !attached[index]) {
+  if (index >= FINGER_COUNT ||
+      (AVAILABLE_FINGERS_MASK & (1U << index)) == 0 || !attached[index]) {
     return false;
   }
 
@@ -123,14 +126,14 @@ bool ServoManager::startMoveFinger(uint8_t index, int targetAngle,
 bool ServoManager::startMoveFingers(
     uint8_t mask, const int targetAngles[FINGER_COUNT],
     const uint32_t durationMs[FINGER_COUNT], uint32_t nowMs,
-    uint8_t maxCommandStepDeg) {
+    uint8_t maxCommandStepDeg, TrajectoryShape shape) {
   if (motionActive || targetAngles == nullptr || durationMs == nullptr ||
       maxCommandStepDeg == 0) {
     return false;
   }
 
   mask &= ALL_FINGERS_MASK;
-  if (mask == 0) {
+  if (mask == 0 || (mask & TEMP_DISABLED_FINGER_MASK) != 0) {
     return false;
   }
 
@@ -166,6 +169,7 @@ bool ServoManager::startMoveFingers(
   motionStartTimeMs = nowMs;
   lastMotionUpdateTimeMs = nowMs;
   motionMaxCommandStepDeg = maxCommandStepDeg;
+  motionShape = shape;
   motionActive = movingMask != 0;
   return true;
 }
@@ -176,7 +180,7 @@ bool ServoManager::startReturn(uint8_t mask, uint32_t durationMs,
     return false;
   }
 
-  mask &= ALL_FINGERS_MASK;
+  mask &= AVAILABLE_FINGERS_MASK;
   uint8_t movingMask = 0;
   int targetAngles[FINGER_COUNT];
   uint32_t durations[FINGER_COUNT];
@@ -217,6 +221,9 @@ void ServoManager::detachAll() {
 
 bool ServoManager::setEnabledMask(uint8_t mask) {
   mask &= ALL_FINGERS_MASK;
+  if ((mask & TEMP_DISABLED_FINGER_MASK) != 0) {
+    return false;
+  }
 
   // Never remove PWM from a finger that still needs a controlled return.
   for (uint8_t i = 0; i < FINGER_COUNT; ++i) {
@@ -243,7 +250,7 @@ bool ServoManager::setEnabledMask(uint8_t mask) {
 
 bool ServoManager::isAttached() const {
   for (uint8_t i = 0; i < FINGER_COUNT; ++i) {
-    if (!attached[i]) {
+    if ((AVAILABLE_FINGERS_MASK & (1U << i)) != 0 && !attached[i]) {
       return false;
     }
   }
@@ -283,7 +290,8 @@ int ServoManager::logicalToPhysical(uint8_t index, int logicalAngle) const {
 }
 
 bool ServoManager::attachFinger(uint8_t index) {
-  if (index >= FINGER_COUNT) {
+  if (index >= FINGER_COUNT ||
+      (AVAILABLE_FINGERS_MASK & (1U << index)) == 0) {
     return false;
   }
   if (attached[index]) {
@@ -313,7 +321,10 @@ bool ServoManager::updateTrajectoryFinger(uint8_t index, uint32_t elapsed) {
     progress = static_cast<float>(elapsed) /
                static_cast<float>(motionDurationMs[index]);
   }
-  const float shapedProgress = quinticSmoothStep(progress);
+  const float shapedProgress =
+      motionShape == TrajectoryShape::TRAINING_EASE_OUT
+          ? trainingEaseOut(progress)
+          : quinticSmoothStep(progress);
   const float interpolated =
       static_cast<float>(motionStartAngles[index]) +
       static_cast<float>(motionTargetAngles[index] -
@@ -358,4 +369,18 @@ float ServoManager::quinticSmoothStep(float progress) {
   const float p2 = progress * progress;
   const float p3 = p2 * progress;
   return p3 * (10.0f + progress * (-15.0f + 6.0f * progress));
+}
+
+float ServoManager::trainingEaseOut(float progress) {
+  if (progress <= 0.0f) {
+    return 0.0f;
+  }
+  if (progress >= 1.0f) {
+    return 1.0f;
+  }
+
+  // Integral of 12*p*(1-p)^2: zero speed at both ends, peak speed at 1/3
+  // of the time, and progressively slower movement toward the target.
+  const float p2 = progress * progress;
+  return p2 * (6.0f + progress * (-8.0f + 3.0f * progress));
 }

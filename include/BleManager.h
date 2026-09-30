@@ -22,6 +22,11 @@ private:
     char data[BLE_MAX_COMMAND_LENGTH + 1];
   };
 
+  struct TxMessage {
+    // A negotiated 247-byte ATT MTU carries at most 244 payload bytes.
+    char data[BLE_LOCAL_MTU - 2U];
+  };
+
   BLEServer* pServer;
   BLECharacteristic* pTxCharacteristic;
   BLECharacteristic* pRxCharacteristic;
@@ -30,13 +35,18 @@ private:
   volatile uint16_t negotiatedMtu;
   QueueHandle_t commandQueue;
   QueueHandle_t safetyQueue;
+  QueueHandle_t txQueue;
+  uint32_t lastTxTime;
 
 public:
   BleManager();
   void begin();
+  void update(uint32_t nowMs);
   
   // 상태 데이터 앱으로 전송 (TX)
-  void sendData(String message);
+  // State/events are important by default. Realtime telemetry passes false
+  // so it can retry instead of displacing an event when the queue is full.
+  bool sendData(const String& message, bool important = true);
   
   // 데이터 수신 여부 확인 및 가져오기 (RX)
   bool available();

@@ -5,6 +5,11 @@
 
 class ServoManager {
 public:
+  enum class TrajectoryShape : uint8_t {
+    QUINTIC,
+    TRAINING_EASE_OUT
+  };
+
   ServoManager();
 
   bool begin();
@@ -24,12 +29,14 @@ public:
 
   // Starts a coordinated multi-finger trajectory. Every selected finger is
   // updated in the same scheduler pass from one shared trajectory clock.
+  // Only training extension selects the early-peak/slow-finish shape.
   bool startMoveFingers(uint8_t mask,
                         const int targetAngles[FINGER_COUNT],
                         const uint32_t durationMs[FINGER_COUNT],
                         uint32_t nowMs,
                         uint8_t maxCommandStepDeg =
-                            SERVO_MAX_COMMAND_STEP_DEG);
+                            SERVO_MAX_COMMAND_STEP_DEG,
+                        TrajectoryShape shape = TrajectoryShape::QUINTIC);
 
   // Returns every finger in mask from its commanded position to home.
   bool startReturn(uint8_t mask, uint32_t durationMs, uint32_t nowMs);
@@ -56,6 +63,7 @@ private:
   uint32_t motionStartTimeMs;
   uint32_t lastMotionUpdateTimeMs;
   uint8_t motionMaxCommandStepDeg;
+  TrajectoryShape motionShape;
   bool motionActive;
 
   int logicalToPhysical(uint8_t index, int logicalAngle) const;
@@ -63,4 +71,5 @@ private:
   bool updateTrajectoryFinger(uint8_t index, uint32_t elapsed);
   bool allActiveTargetsReached() const;
   static float quinticSmoothStep(float progress);
+  static float trainingEaseOut(float progress);
 };

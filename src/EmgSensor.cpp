@@ -47,7 +47,6 @@ EmgSensor::EmgSensor()
       windowReady(false),
       signalQualityGood(false),
       lastConsumedSequence(0),
-      featureGapDetected(false),
       samplingTaskHandle(nullptr),
       samplingTimer(nullptr),
       initialized(false),
@@ -204,10 +203,10 @@ bool EmgSensor::update(uint32_t nowMs) {
         return false;
     }
 
-    if (lastConsumedSequence != 0 &&
-        static_cast<uint32_t>(sequence - lastConsumedSequence) > 1U) {
-        featureGapDetected = true;
-    }
+    // The control loop only needs the newest feature. It can legitimately
+    // skip intermediate 10 ms snapshots while BLE sends notifications; that
+    // is not a raw ADC sampling failure because acquisition runs in its own
+    // task.
     extensorRMS = newExtensorRMS;
     flexorRMS = newFlexorRMS;
     windowReady = newWindowReady;
@@ -234,7 +233,6 @@ void EmgSensor::resetSignalWindow() {
     windowReady = false;
     signalQualityGood = false;
     lastConsumedSequence = invalidatedSequence;
-    featureGapDetected = false;
 }
 
 bool EmgSensor::consumeSamplingGap() {
@@ -242,12 +240,6 @@ bool EmgSensor::consumeSamplingGap() {
     const bool detected = samplingGapLatched;
     samplingGapLatched = false;
     portEXIT_CRITICAL(&dataMux);
-    return detected;
-}
-
-bool EmgSensor::consumeFeatureGap() {
-    const bool detected = featureGapDetected;
-    featureGapDetected = false;
     return detected;
 }
 

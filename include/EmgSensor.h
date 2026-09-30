@@ -24,7 +24,6 @@ public:
     bool isSignalQualityGood() const { return signalQualityGood; }
     bool isSamplingHealthy(uint32_t nowMs) const;
     bool consumeSamplingGap();
-    bool consumeFeatureGap();
     uint32_t getMissedRawSampleCount() const;
     bool hasValidBatteryReading() const;
     uint8_t getBatteryPercent() const;
@@ -88,7 +87,6 @@ private:
     bool windowReady;
     bool signalQualityGood;
     uint32_t lastConsumedSequence;
-    bool featureGapDetected;
 
     // Sampling task/timer lifecycle.
     TaskHandle_t samplingTaskHandle;

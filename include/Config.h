@@ -5,6 +5,11 @@
 // Hardware layout -----------------------------------------------------------
 constexpr uint8_t FINGER_COUNT = 5;
 constexpr uint8_t ALL_FINGERS_MASK = (1U << FINGER_COUNT) - 1U;
+// Temporary lockout for the faulty index servo (bit 1). Set to 0 only after
+// repairing it and verifying motion; then run full calibration again.
+constexpr uint8_t TEMP_DISABLED_FINGER_MASK = 1U << 1;
+constexpr uint8_t AVAILABLE_FINGERS_MASK =
+    ALL_FINGERS_MASK & static_cast<uint8_t>(~TEMP_DISABLED_FINGER_MASK);
 
 // 0: thumb, 1: index, 2: middle, 3: ring, 4: pinky
 constexpr uint8_t SERVO_PINS[FINGER_COUNT] = {16, 17, 18, 19, 21};
@@ -53,6 +58,8 @@ constexpr uint32_t I2C_FREQUENCY_HZ = 100000;
 
 constexpr uint8_t BLE_COMMAND_QUEUE_LENGTH = 8;
 constexpr size_t BLE_MAX_COMMAND_LENGTH = 64;
+constexpr uint8_t BLE_TX_QUEUE_LENGTH = 16;
+constexpr uint32_t BLE_TX_PACKET_GAP_MS = 20;
 // JSON telemetry uses the database field names directly. A 247-byte ATT MTU
 // leaves a 244-byte notification payload; the final log is split into two
 // complete JSON objects so no application-level string fragmentation is used.
@@ -66,13 +73,23 @@ constexpr uint32_t BLE_STATIC_PASSKEY = 654321;
 // Raw sEMG acquisition and feature extraction ------------------------------
 // The sensor output is a 1.5 V-centred raw waveform with useful energy up to
 // 500 Hz, so acquisition runs independently from the 10 ms control loop.
-constexpr uint32_t EMG_RAW_SAMPLE_RATE_HZ = 2000;
+// The sensor requires at least 1 kHz. On this ESP32, 2 kHz task wake-ups
+// periodically accumulated while BLE was active, repeatedly invalidating the
+// RMS window and preventing calibration from collecting 500 features. A
+// stable 1 kHz stream meets the sensor vendor's minimum sampling guidance;
+// the digital 450 Hz low-pass stays below its 500 Hz Nyquist frequency while
+// leaving enough scheduling margin for BLE and control processing.
+constexpr uint32_t EMG_RAW_SAMPLE_RATE_HZ = 1000;
 constexpr uint32_t EMG_RAW_SAMPLE_INTERVAL_US =
     1000000UL / EMG_RAW_SAMPLE_RATE_HZ;
-constexpr uint32_t EMG_RAW_GAP_LIMIT_US = 1500;
+constexpr uint32_t EMG_RAW_GAP_LIMIT_US =
+    3UL * EMG_RAW_SAMPLE_INTERVAL_US;
 constexpr uint32_t EMG_FEATURE_INTERVAL_MS = 10;
 constexpr uint32_t EMG_EVIDENCE_MAX_GAP_MS = 30;
 constexpr uint32_t EMG_FEATURE_HEALTH_TIMEOUT_MS = 40;
+// A single delayed feature can occur while BLE notifications are being sent.
+// Only a sustained acquisition/quality problem is treated as a sensor fault.
+constexpr uint32_t EMG_FAULT_CONFIRM_MS = 500;
 // Preserve the original 250 ms envelope while acquiring the raw waveform at
 // a rate that can actually represent the sensor's 20-500 Hz signal.
 constexpr uint16_t EMG_RMS_WINDOW_MS = 250;
@@ -80,7 +97,7 @@ constexpr uint16_t EMG_RMS_SAMPLE_COUNT =
     static_cast<uint16_t>((EMG_RAW_SAMPLE_RATE_HZ * EMG_RMS_WINDOW_MS) /
                           1000UL);
 // Match the sensor vendor's 20 Hz motion-artifact cutoff. Coefficients are
-// calculated for this project's 2 kHz sampling rate instead of copying the
+// calculated for this project's configured sampling rate instead of copying the
 // vendor library's fixed 500/1000 Hz tables.
 constexpr float EMG_HIGH_PASS_CUTOFF_HZ = 20.0f;
 constexpr float EMG_LOW_PASS_CUTOFF_HZ = 450.0f;
@@ -98,11 +115,13 @@ constexpr float EMG_REST_ROBUST_SIGMA_MULTIPLIER = 3.0f;
 constexpr float EMG_MAD_TO_SIGMA_SCALE = 1.4826f;
 constexpr float EMG_REST_NOISE_PERCENTILE = 0.95f;
 constexpr float EMG_MVC_TOP_FRACTION = 0.10f;
-// CH1 remains strict because it drives the training trigger/participation
-// decision. Recent repeated CH2 logs showed a stable 13-15 ADC rest-to-flexion
-// span, so CH2 uses a lower absolute floor while retaining the same relative
-// separation requirement. This still rejects the 8.86 ADC weak-signal case.
-constexpr float EMG_EXTENSOR_MIN_CALIBRATION_SPAN = 20.0f;
+// Permit a weaker CH1 voluntary contraction during calibration while keeping
+// the rest-noise threshold and relative separation check unchanged. This
+// accepts a 15-count rest-to-MVC span instead of requiring 20 counts when
+// the 25% relative check is smaller; sustained trigger checks still apply.
+// Recent repeated CH2 logs showed a stable 13-15 ADC rest-to-flexion span,
+// so CH2 retains its separate lower absolute floor.
+constexpr float EMG_EXTENSOR_MIN_CALIBRATION_SPAN = 15.0f;
 constexpr float EMG_FLEXOR_MIN_CALIBRATION_SPAN = 10.0f;
 constexpr float EMG_MIN_CALIBRATION_SPAN_RATIO = 0.25f;
 
@@ -111,23 +130,29 @@ constexpr float CURRENT_FILTER_ALPHA = 0.25f;
 // Absolute soft current is retained as a fallback electrical/mechanical load
 // ceiling. ROM uses a per-finger relative-current endpoint, while training
 // uses only the selected group's scaled safety ceiling.
-constexpr float STALL_CURRENT_THRES_MA = 800.0f;
+constexpr float STALL_CURRENT_THRES_MA = 100.0f;
 // Hard overcurrent can also mean a jam, short, or severe impact. It always
 // detaches the servos and is never accepted as a calibration endpoint.
 constexpr float HARD_CURRENT_THRES_MA = 1600.0f;
 constexpr uint32_t STALL_CONFIRM_TIME_MS = 150;
 constexpr uint32_t RETURN_STALL_CONFIRM_TIME_MS = 250;
 
-// ROM per-finger current-rise allowances. These 150 mA values are only
-// initial bench-test values; they are not a validated human-force limit.
+// ROM per-finger current-rise allowances (thumb..pinky). In the installed
+// glove the pinky repeatedly rose by about +76 mA at the first 2 degrees;
+// +35 mA caused an endless early-trip/retry loop. +85 mA clears that observed
+// startup peak with a small margin, but is not a validated human-force limit.
+// Keep the other fingers unchanged.
 constexpr float ROM_FINGER_CURRENT_RISE_LIMIT_MA[FINGER_COUNT] = {
-    150.0f, 150.0f, 150.0f, 150.0f, 150.0f};
+    100.0f, 100.0f, 100.0f, 100.0f, 85.0f};
+// A relative ROM endpoint may be above the general soft limit. It is still
+// capped well below the hard electrical limit, which is monitored globally.
+constexpr float ROM_HARD_CURRENT_MARGIN_MA = 100.0f;
 
 // Calibration ---------------------------------------------------------------
 constexpr uint32_t CALIBRATION_PREPARE_MS = 2000;
 constexpr uint32_t CALIBRATION_DURATION_MS = 5000;
 constexpr uint32_t CALIBRATION_COLLECTION_TIMEOUT_MS =
-    CALIBRATION_DURATION_MS + 250;
+    CALIBRATION_DURATION_MS + 3000;
 constexpr uint16_t EMG_CALIBRATION_FEATURE_COUNT =
     CALIBRATION_DURATION_MS / EMG_FEATURE_INTERVAL_MS;
 constexpr uint32_t ROM_PREPARE_MS = 1000;
@@ -151,16 +176,35 @@ constexpr float ASSISTANCE_RELATIVE_SPREAD_FULL = 0.20f;
 // Training -----------------------------------------------------------------
 constexpr uint32_t TRAIN_TRIGGER_HOLD_MS = 300;
 constexpr float TRAIN_TRIGGER_ACTIVATION = 0.15f;
-constexpr uint32_t TRAIN_RELEASE_HOLD_MS = 300;
-constexpr float TRAIN_RELEASE_ACTIVATION = 0.05f;
+// Electrode contact and the RMS noise floor can drift after calibration.
+// Learn a fresh relaxed CH1 baseline before every cycle, then require a clear
+// rise above that local baseline. This prevents a low calibration threshold
+// from trapping training forever in WAITING_RELEASE.
+constexpr uint32_t TRAIN_RELEASE_HOLD_MS = 1000;
+constexpr float TRAIN_TRIGGER_ABOVE_REST_ACTIVATION = 0.15f;
+// After the first cycle, do not learn a new baseline while the patient may
+// still be exerting. Re-arm only after CH1 falls below the trigger point by
+// this hysteresis for a short time, then wait for the next rising edge.
+constexpr uint32_t TRAIN_REARM_HOLD_MS = 300;
+constexpr float TRAIN_REARM_HYSTERESIS = 0.05f;
 constexpr float COCONTRACTION_EXTENSOR_LEVEL = 0.20f;
-constexpr float COCONTRACTION_FLEXOR_LEVEL = 0.90f;
+// During training, CH2 must reach this fraction of its calibrated
+// rest-to-MVC range for the full confirmation time below. Start with 60%;
+// increase it if normal extension repeatedly causes false cocontraction.
+constexpr float COCONTRACTION_FLEXOR_LEVEL = 0.60f;
 constexpr uint32_t COCONTRACTION_HOLD_MS = 1000;
+// Keep the stricter CH2 limits for starting a cycle and for passive ROM;
+// lowering the training detector must not make either phase harder to enter.
+constexpr float TRAIN_TRIGGER_FLEXOR_VETO_LEVEL = 0.90f;
+constexpr float ROM_FLEXOR_RESISTANCE_LEVEL = 0.90f;
 
 // Every assistance level uses the same trajectory duration. Levels change
 // only the CH1 participation requirement below; they never make the motor
 // faster or more aggressive.
-constexpr uint32_t TRAIN_MOVE_DURATION_MS = 5000;
+// Training uses a separate front-loaded but zero-velocity-start trajectory:
+// take up slack early, then leave several seconds near the target for EMG
+// participation and cocontraction observation. ROM and returns stay quintic.
+constexpr uint32_t TRAIN_MOVE_DURATION_MS = 12000;
 constexpr float TRAIN_PARTICIPATION_LEVEL_1_RATIO = 0.70f;
 constexpr float TRAIN_PARTICIPATION_LEVEL_10_RATIO = 0.35f;
 constexpr float TRAIN_PARTICIPATION_MIN_ACTIVATION = 0.05f;
@@ -181,13 +225,14 @@ constexpr uint8_t TRAIN_STALL_PERSIST_SAMPLES =
 constexpr uint8_t TRAIN_STALL_CLEAR_SAMPLES = 5;
 constexpr uint32_t TRAIN_STALL_CONFIRM_TIMEOUT_MS = 500;
 constexpr uint8_t TRAIN_MAX_TRANSIENT_RESUMES = 3;
-constexpr uint32_t TRAIN_RESUME_MIN_DURATION_MS = 500;
-// The soft group limit rises with the number of simultaneously enabled
-// fingers. HARD_CURRENT_THRES_MA remains an absolute electrical ceiling and
-// is deliberately not multiplied by finger count.
-constexpr float TRAIN_ADDITIONAL_FINGER_CURRENT_ALLOWANCE_MA = 150.0f;
+constexpr uint32_t TRAIN_RESUME_MIN_DURATION_MS = 3000;
+// With one shared INA219, add the selected fingers' ROM current-rise budgets
+// only once over the common baseline, then discount the sum for simultaneous
+// operation. Never let adding a finger lower the group limit below the
+// highest selected single-finger trip. This is a bench-test starting value.
+constexpr float TRAIN_GROUP_CURRENT_RISE_SUM_FACTOR = 0.60f;
 constexpr float TRAIN_HARD_CURRENT_MARGIN_MA = 100.0f;
-constexpr uint8_t TRAIN_GROUP_MAX_COMMAND_STEP_DEG = 10;
+constexpr uint8_t TRAIN_GROUP_MAX_COMMAND_STEP_DEG = 2;
 constexpr uint32_t TRAIN_ATTACH_SETTLE_MS = 300;
 constexpr uint32_t TRAIN_PREPARE_TIMEOUT_MS = 3000;
 constexpr uint32_t TRAIN_HOLD_TIME_MS = 3000;
@@ -196,6 +241,10 @@ constexpr uint32_t SERVO_RETURN_TIMEOUT_MS = 4500;
 constexpr uint8_t FAILURES_BEFORE_LEVEL_UP = 3;
 constexpr uint8_t TRAIN_SUCCESS_GOAL = 5;
 constexpr uint32_t TELEMETRY_INTERVAL_MS = 1000;
+// Realtime JSON is split into five notifications. Sending all five in one
+// loop can block long enough to look like a control/EMG timing failure, so
+// transmit one packet per loop with a small gap.
+constexpr uint32_t TELEMETRY_PACKET_GAP_MS = 20;
 // A longer loop pause makes EMG and current evidence unreliable. Fail closed
 // instead of continuing an actuator trajectory on stale measurements.
 constexpr uint32_t CONTROL_LOOP_MAX_GAP_MS = 35;
@@ -215,6 +264,15 @@ static_assert(!SERVO_REVERSED[0] && SERVO_REVERSED[1] &&
 static_assert(SERVO_COMMAND_INTERVAL_MS > 0 &&
                   SERVO_MAX_COMMAND_STEP_DEG > 0,
               "Servo slew limiter must make progress");
+static_assert(TRAIN_RELEASE_HOLD_MS > 0 && TRAIN_REARM_HOLD_MS > 0 &&
+                  TRAIN_TRIGGER_ACTIVATION > 0.0f &&
+                  TRAIN_TRIGGER_ACTIVATION < 1.0f &&
+                  TRAIN_TRIGGER_ABOVE_REST_ACTIVATION > 0.0f &&
+                  TRAIN_TRIGGER_ABOVE_REST_ACTIVATION < 1.0f &&
+                  TRAIN_REARM_HYSTERESIS > 0.0f &&
+                  TRAIN_REARM_HYSTERESIS <
+                      TRAIN_TRIGGER_ABOVE_REST_ACTIVATION,
+              "Training trigger/re-arm hysteresis is invalid");
 static_assert(HARD_CURRENT_THRES_MA > STALL_CURRENT_THRES_MA,
               "Hard current limit must exceed the soft limit");
 static_assert(ROM_FINGER_CURRENT_RISE_LIMIT_MA[0] > 0.0f &&
@@ -223,6 +281,12 @@ static_assert(ROM_FINGER_CURRENT_RISE_LIMIT_MA[0] > 0.0f &&
                   ROM_FINGER_CURRENT_RISE_LIMIT_MA[3] > 0.0f &&
                   ROM_FINGER_CURRENT_RISE_LIMIT_MA[4] > 0.0f,
               "Every ROM current-rise allowance must be positive");
+static_assert(TRAIN_GROUP_CURRENT_RISE_SUM_FACTOR > 0.0f &&
+                  TRAIN_GROUP_CURRENT_RISE_SUM_FACTOR < 1.0f,
+              "Training group current discount must be between 0 and 1");
+static_assert(ROM_HARD_CURRENT_MARGIN_MA > 0.0f &&
+                  ROM_HARD_CURRENT_MARGIN_MA < HARD_CURRENT_THRES_MA,
+              "ROM hard-current margin is invalid");
 static_assert(EMG_RAW_SAMPLE_RATE_HZ >= 1000 &&
                   1000000UL % EMG_RAW_SAMPLE_RATE_HZ == 0,
               "EMG sample rate must be at least 1 kHz and divide 1 MHz");
@@ -262,6 +326,8 @@ static_assert(EMG_ADC_RAIL_MARGIN_COUNTS < 2048 &&
               "EMG saturation limits are invalid");
 static_assert(EMG_FEATURE_HEALTH_TIMEOUT_MS >= EMG_EVIDENCE_MAX_GAP_MS,
               "EMG health timeout must allow the evidence gap");
+static_assert(EMG_FAULT_CONFIRM_MS >= EMG_FEATURE_HEALTH_TIMEOUT_MS,
+              "EMG fault confirmation must reject brief feature delays");
 static_assert(EMG_REST_NOISE_PERCENTILE > 0.5f &&
                   EMG_REST_NOISE_PERCENTILE < 1.0f &&
                   EMG_MVC_TOP_FRACTION > 0.0f &&
@@ -276,6 +342,10 @@ static_assert(COCONTRACTION_EXTENSOR_LEVEL > 0.0f &&
                   COCONTRACTION_EXTENSOR_LEVEL <= 1.0f &&
                   COCONTRACTION_FLEXOR_LEVEL > 0.0f &&
                   COCONTRACTION_FLEXOR_LEVEL <= 1.0f &&
+                  TRAIN_TRIGGER_FLEXOR_VETO_LEVEL > 0.0f &&
+                  TRAIN_TRIGGER_FLEXOR_VETO_LEVEL <= 1.0f &&
+                  ROM_FLEXOR_RESISTANCE_LEVEL > 0.0f &&
+                  ROM_FLEXOR_RESISTANCE_LEVEL <= 1.0f &&
                   COCONTRACTION_HOLD_MS > 0,
               "Cocontraction confirmation settings are invalid");
 static_assert(EMG_CALIBRATION_FEATURE_COUNT > 0,
@@ -309,8 +379,7 @@ static_assert(TRAIN_MOTOR_ATTACH_STAGGER_MS > 0 &&
                   TRAIN_MAX_TRANSIENT_RESUMES > 0 &&
                   TRAIN_STALL_CONFIRM_TIMEOUT_MS > STALL_CONFIRM_TIME_MS,
               "Training attach/current safety timing is invalid");
-static_assert(TRAIN_ADDITIONAL_FINGER_CURRENT_ALLOWANCE_MA >= 0.0f &&
-                  TRAIN_HARD_CURRENT_MARGIN_MA > 0.0f &&
+static_assert(TRAIN_HARD_CURRENT_MARGIN_MA > 0.0f &&
                   TRAIN_HARD_CURRENT_MARGIN_MA < HARD_CURRENT_THRES_MA,
               "Training group-current limits are invalid");
 static_assert(TRAIN_PREPARE_TIMEOUT_MS >
@@ -341,4 +410,3 @@ enum class SystemState : uint8_t {
   SAFETY_RETURNING,
   FAULT
 };
-
